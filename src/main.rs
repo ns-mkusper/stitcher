@@ -1,0 +1,330 @@
+use anyhow::{Context, Result, bail};
+use askama::Template;
+use axum::extract::{DefaultBodyLimit, Multipart};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use clap::{Parser, Subcommand, ValueEnum};
+use image::ImageFormat;
+use serde_json::json;
+use std::io::Cursor;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use stitcher::{
+    PanMode, StitchOptions, detect_duplicates, draw_duplicate_overlay, load_images, stitch_images,
+};
+use tokio::fs;
+use tower_http::services::ServeDir;
+use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
+
+#[derive(Parser, Debug)]
+#[command(name = "stitcher")]
+#[command(about = "Reconstruct a single still from ordered pan screenshots")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Stitch images from the command line.
+    Stitch(StitchArgs),
+    /// Run the browser-based GUI.
+    Serve(ServeArgs),
+}
+
+#[derive(Parser, Debug)]
+struct StitchArgs {
+    /// Ordered input screenshots, earliest to latest.
+    #[arg(required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Output PNG/JPEG path.
+    #[arg(short, long)]
+    output: PathBuf,
+
+    /// Run duplicate-region success gate.
+    #[arg(long)]
+    check_duplicates: bool,
+
+    /// Write duplicate overlay PNG next to the output.
+    #[arg(long)]
+    duplicate_overlay: bool,
+
+    /// Pan detection mode.
+    #[arg(long, value_enum, default_value_t = CliPanMode::Auto)]
+    mode: CliPanMode,
+
+    #[arg(long, default_value_t = 30)]
+    min_shift_y: i32,
+    #[arg(long)]
+    max_shift_y: Option<i32>,
+    #[arg(long, default_value_t = 30)]
+    min_shift_x: i32,
+    #[arg(long)]
+    max_shift_x: Option<i32>,
+    #[arg(long, default_value_t = 60)]
+    max_drift_x: i32,
+    #[arg(long, default_value_t = 60)]
+    max_drift_y: i32,
+    #[arg(long, default_value_t = 4)]
+    align_scale: usize,
+    #[arg(long, default_value_t = 3)]
+    snap_x: i32,
+
+    /// Save a JSON report with shifts, canvas positions, and duplicate findings.
+    #[arg(long)]
+    report: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct ServeArgs {
+    /// Address to bind, e.g. 127.0.0.1:3000.
+    #[arg(long, default_value = "127.0.0.1:3000")]
+    bind: SocketAddr,
+
+    /// Directory for generated web outputs.
+    #[arg(long, default_value = "./stitcher-web-output")]
+    output_dir: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliPanMode {
+    Auto,
+    Vertical,
+    Horizontal,
+}
+
+impl From<CliPanMode> for PanMode {
+    fn from(value: CliPanMode) -> Self {
+        match value {
+            CliPanMode::Auto => PanMode::Auto,
+            CliPanMode::Vertical => PanMode::Vertical,
+            CliPanMode::Horizontal => PanMode::Horizontal,
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "index.html")]
+struct IndexTemplate;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Stitch(args) => stitch_cli(args),
+        Commands::Serve(args) => serve(args).await,
+    }
+}
+
+fn options_from_args(args: &StitchArgs) -> StitchOptions {
+    StitchOptions {
+        mode: args.mode.into(),
+        min_shift_y: args.min_shift_y,
+        max_shift_y: args.max_shift_y,
+        min_shift_x: args.min_shift_x,
+        max_shift_x: args.max_shift_x,
+        max_drift_x: args.max_drift_x,
+        max_drift_y: args.max_drift_y,
+        align_scale: args.align_scale,
+        snap_x: args.snap_x,
+        check_duplicates: args.check_duplicates,
+    }
+}
+
+fn stitch_cli(args: StitchArgs) -> Result<()> {
+    let images = load_images(&args.inputs).context("loading input images")?;
+    let opts = options_from_args(&args);
+    let (stitched, mut report) = stitch_images(&images, &opts).context("stitching images")?;
+    stitched
+        .save(&args.output)
+        .with_context(|| format!("saving {}", args.output.display()))?;
+    println!("wrote {}", args.output.display());
+
+    if args.duplicate_overlay {
+        let dup = report
+            .duplicate_report
+            .clone()
+            .unwrap_or_else(|| detect_duplicates(&stitched));
+        let overlay = draw_duplicate_overlay(&stitched, &dup);
+        let overlay_path = overlay_path_for(&args.output);
+        overlay
+            .save(&overlay_path)
+            .with_context(|| format!("saving {}", overlay_path.display()))?;
+        println!("wrote {}", overlay_path.display());
+        report.duplicate_report = Some(dup);
+    }
+
+    if let Some(dup) = &report.duplicate_report {
+        if dup.passed {
+            println!("DUPLICATE TEST: PASS");
+        } else {
+            bail!("DUPLICATE TEST: FAIL");
+        }
+    }
+
+    if let Some(path) = &args.report {
+        let json = serde_json::to_string_pretty(&report)?;
+        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+async fn serve(args: ServeArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    fs::create_dir_all(&args.output_dir).await?;
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/api/stitch", post(upload_and_stitch))
+        .nest_service("/outputs", ServeDir::new(args.output_dir.clone()))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 80))
+        .with_state(args.output_dir.clone());
+
+    tracing::info!("serving stitcher GUI at http://{}", args.bind);
+    let listener = tokio::net::TcpListener::bind(args.bind).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn index() -> Result<Html<String>, AppError> {
+    Ok(Html(IndexTemplate.render()?))
+}
+
+async fn upload_and_stitch(
+    axum::extract::State(output_dir): axum::extract::State<PathBuf>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let mut images = Vec::new();
+    while let Some(field) = multipart.next_field().await? {
+        if field.name() != Some("images") {
+            continue;
+        }
+        let bytes = field.bytes().await?;
+        let img = image::load_from_memory(&bytes)?.into_rgb8();
+        images.push(img);
+    }
+    if images.len() < 2 {
+        return Err(AppError::bad_request("upload at least two images"));
+    }
+
+    let opts = StitchOptions {
+        check_duplicates: true,
+        ..Default::default()
+    };
+    let (stitched, report) = stitch_images(&images, &opts)?;
+    let id = Uuid::new_v4().to_string();
+    let png_name = format!("{id}.png");
+    let report_name = format!("{id}.json");
+    let png_path = output_dir.join(&png_name);
+    let report_path = output_dir.join(&report_name);
+    stitched.save(&png_path)?;
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?).await?;
+
+    Ok(Json(json!({
+        "image_url": format!("/outputs/{png_name}"),
+        "report_url": format!("/outputs/{report_name}"),
+        "report": report
+    })))
+}
+
+fn overlay_path_for(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("stitched");
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{}_duplicate_overlay.png", stem))
+}
+
+#[derive(Debug)]
+struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(err: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<askama::Error> for AppError {
+    fn from(err: askama::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<axum::extract::multipart::MultipartError> for AppError {
+    fn from(err: axum::extract::multipart::MultipartError) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<image::ImageError> for AppError {
+    fn from(err: image::ImageError) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(err: std::io::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(err: serde_json::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let body = Json(json!({ "error": self.message }));
+        (self.status, body).into_response()
+    }
+}
+
+#[allow(dead_code)]
+fn image_response_png(img: &image::RgbImage) -> Result<Response> {
+    let mut bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    Ok((headers, bytes).into_response())
+}

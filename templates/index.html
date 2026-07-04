@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stitcher</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #111318; color: #eef2ff; }
+    main { max-width: 980px; margin: 0 auto; padding: 32px 20px; }
+    .card { background: #1b1f2a; border: 1px solid #313849; border-radius: 16px; padding: 20px; box-shadow: 0 18px 40px rgb(0 0 0 / 0.25); }
+    h1 { margin: 0 0 8px; }
+    p { color: #b8c0d6; }
+    input[type=file] { display: block; width: 100%; padding: 16px; border: 1px dashed #566079; border-radius: 12px; background: #121620; color: #d9e1ff; }
+    button { margin-top: 16px; padding: 12px 18px; border: 0; border-radius: 10px; background: #6d8cff; color: #fff; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    img { max-width: 100%; border-radius: 12px; border: 1px solid #313849; background: #0c0e13; }
+    pre { overflow: auto; background: #0c0e13; border: 1px solid #313849; border-radius: 12px; padding: 14px; color: #c8d2ff; }
+    .error { color: #ff9a9a; }
+    .ok { color: #90f5b7; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>Stitcher</h1>
+      <p>Upload ordered screenshots from a pan. The server will auto-detect vertical or horizontal pan direction, stitch them, and run the duplicate gate.</p>
+      <form id="form">
+        <input id="images" name="images" type="file" accept="image/png,image/jpeg" multiple required />
+        <button id="submit" type="submit">Stitch images</button>
+      </form>
+      <p id="status"></p>
+    </section>
+
+    <section id="result" class="card" style="display:none; margin-top: 20px;">
+      <h2>Result</h2>
+      <p><a id="download" href="#" download>Download stitched image</a> · <a id="report-link" href="#" download>Download JSON report</a></p>
+      <img id="preview" alt="stitched output preview" />
+      <h3>Report</h3>
+      <pre id="report"></pre>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById('form');
+    const statusEl = document.getElementById('status');
+    const button = document.getElementById('submit');
+    const result = document.getElementById('result');
+    const preview = document.getElementById('preview');
+    const report = document.getElementById('report');
+    const download = document.getElementById('download');
+    const reportLink = document.getElementById('report-link');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const files = document.getElementById('images').files;
+      if (files.length < 2) {
+        statusEl.className = 'error';
+        statusEl.textContent = 'Upload at least two images.';
+        return;
+      }
+      const data = new FormData();
+      for (const file of files) data.append('images', file, file.name);
+      button.disabled = true;
+      statusEl.className = '';
+      statusEl.textContent = 'Stitching...';
+      result.style.display = 'none';
+      try {
+        const response = await fetch('/api/stitch', { method: 'POST', body: data });
+        const json = await response.json();
+        if (!response.ok) throw new Error(json.error || 'stitch failed');
+        preview.src = json.image_url;
+        download.href = json.image_url;
+        reportLink.href = json.report_url;
+        report.textContent = JSON.stringify(json.report, null, 2);
+        statusEl.className = 'ok';
+        statusEl.textContent = 'Done. Duplicate gate passed.';
+        result.style.display = 'block';
+      } catch (err) {
+        statusEl.className = 'error';
+        statusEl.textContent = err.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
