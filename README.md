@@ -49,6 +49,41 @@ cargo run --release -- serve --bind 127.0.0.1:3000
 
 Open `http://127.0.0.1:3000`, upload ordered screenshots, and download the result.
 
+## Evaluation
+
+`stitcher eval` checks whether a stitched output is cohesive and faithful instead of just visually plausible.
+
+```bash
+cargo run --release -- stitch \
+  --output stitched.png \
+  --report stitched.json \
+  --source-map source_map.png \
+  frame1.jpg frame2.jpg frame3.jpg
+
+cargo run --release -- eval \
+  --stitched stitched.png \
+  --report stitched.json \
+  --source-map source_map.png \
+  --output eval.json \
+  --overlay eval_overlay.png \
+  --source-block-overlay source_blocks.png
+```
+
+The evaluator reports:
+
+- source handoff boundary pixels
+- high-risk visible seam pixels
+- largest connected risky seam component
+- duplicate bands/patches
+- per-source handoff risk counts
+- pass/fail failures
+
+Overlay colors:
+
+- yellow = source handoff boundary
+- red = high-risk visible seam / component
+- tinted regions = source frame blocks
+
 ## CI / PR tests
 
 GitHub Actions workflow: `.github/workflows/ci.yml`
@@ -60,3 +95,5 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
+
+Tests include pan detection plus evaluator pass/fail behavior for clean outputs and visible source-block seams.
