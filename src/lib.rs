@@ -60,9 +60,16 @@ pub struct StitchReport {
     pub duplicate_report: Option<DuplicateReport>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SourceSelection {
+    NearestCenter,
+    SeamDp,
+}
+
 #[derive(Debug, Clone)]
 pub struct StitchOptions {
     pub mode: PanMode,
+    pub source_selection: SourceSelection,
     pub min_shift_y: i32,
     pub max_shift_y: Option<i32>,
     pub min_shift_x: i32,
@@ -78,6 +85,7 @@ impl Default for StitchOptions {
     fn default() -> Self {
         Self {
             mode: PanMode::Auto,
+            source_selection: SourceSelection::NearestCenter,
             min_shift_y: 30,
             max_shift_y: None,
             min_shift_x: 30,
@@ -106,6 +114,14 @@ pub fn stitch_images(
     images: &[RgbImage],
     opts: &StitchOptions,
 ) -> Result<(RgbImage, StitchReport)> {
+    let (stitched, _source_map, report) = stitch_images_with_source_map(images, opts)?;
+    Ok((stitched, report))
+}
+
+pub fn stitch_images_with_source_map(
+    images: &[RgbImage],
+    opts: &StitchOptions,
+) -> Result<(RgbImage, SourceMap, StitchReport)> {
     if images.len() < 2 {
         bail!("need at least two input frames");
     }
@@ -141,7 +157,14 @@ pub fn stitch_images(
 
     let raw_positions = positions_from_shifts(&shifts);
     let (positions, canvas_w, canvas_h) = normalize_positions(&raw_positions, w, h);
-    let stitched = synthesize_nearest_center(images, &positions, canvas_w, canvas_h)?;
+    let (stitched, source_map) = match opts.source_selection {
+        SourceSelection::NearestCenter => {
+            synthesize_nearest_center_with_source_map(images, &positions, canvas_w, canvas_h)?
+        }
+        SourceSelection::SeamDp => {
+            synthesize_vertical_seams_with_source_map(images, &positions, canvas_w, canvas_h)?
+        }
+    };
     let duplicate_report = opts.check_duplicates.then(|| detect_duplicates(&stitched));
     if let Some(report) = &duplicate_report
         && !report.passed
@@ -149,17 +172,15 @@ pub fn stitch_images(
         bail!("DUPLICATE TEST: FAIL");
     }
 
-    Ok((
-        stitched,
-        StitchReport {
-            shifts,
-            raw_positions,
-            normalized_positions: positions,
-            canvas_width: canvas_w,
-            canvas_height: canvas_h,
-            duplicate_report,
-        },
-    ))
+    let report = StitchReport {
+        shifts,
+        raw_positions,
+        normalized_positions: positions,
+        canvas_width: canvas_w,
+        canvas_height: canvas_h,
+        duplicate_report,
+    };
+    Ok((stitched, source_map, report))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -474,10 +495,20 @@ pub fn synthesize_nearest_center(
     canvas_w: u32,
     canvas_h: u32,
 ) -> Result<RgbImage> {
+    Ok(synthesize_nearest_center_with_source_map(images, positions, canvas_w, canvas_h)?.0)
+}
+
+pub fn synthesize_nearest_center_with_source_map(
+    images: &[RgbImage],
+    positions: &[Position],
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Result<(RgbImage, SourceMap)> {
     let (w, h) = images[0].dimensions();
     let center_x = w as f32 / 2.0;
     let center_y = h as f32 / 2.0;
     let mut out = ImageBuffer::from_pixel(canvas_w, canvas_h, Rgb([0, 0, 0]));
+    let mut source_map = SourceMap::new(canvas_w, canvas_h);
     for cy in 0..canvas_h as i32 {
         for cx in 0..canvas_w as i32 {
             let mut best: Option<(f32, usize, u32, u32)> = None;
@@ -485,8 +516,9 @@ pub fn synthesize_nearest_center(
                 let sx = cx - p.x;
                 let sy = cy - p.y;
                 if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 {
-                    let score =
-                        ((sx as f32 - center_x).powi(2) + (sy as f32 - center_y).powi(2)).sqrt();
+                    let score = ((sx as f32 - center_x).powi(2) + (sy as f32 - center_y).powi(2))
+                        .sqrt()
+                        - i as f32 * 0.01;
                     if best.map(|b| score < b.0).unwrap_or(true) {
                         best = Some((score, i, sx as u32, sy as u32));
                     }
@@ -494,10 +526,272 @@ pub fn synthesize_nearest_center(
             }
             if let Some((_score, i, sx, sy)) = best {
                 out.put_pixel(cx as u32, cy as u32, *images[i].get_pixel(sx, sy));
+                source_map.set(cx as u32, cy as u32, i as u8);
             }
         }
     }
-    Ok(out)
+    Ok((out, source_map))
+}
+
+pub fn synthesize_vertical_seams_with_source_map(
+    images: &[RgbImage],
+    positions: &[Position],
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Result<(RgbImage, SourceMap)> {
+    if images.is_empty() {
+        bail!("need at least one image");
+    }
+    let (w, h) = images[0].dimensions();
+    // This first version is for mostly vertical pans. If the stack is not mostly vertical,
+    // fall back to the proven nearest-center method.
+    let span_x = positions.iter().map(|p| p.x).max().unwrap_or(0)
+        - positions.iter().map(|p| p.x).min().unwrap_or(0);
+    let span_y = positions.iter().map(|p| p.y).max().unwrap_or(0)
+        - positions.iter().map(|p| p.y).min().unwrap_or(0);
+    if span_y < span_x {
+        return synthesize_nearest_center_with_source_map(images, positions, canvas_w, canvas_h);
+    }
+
+    let mut order: Vec<usize> = (0..images.len()).collect();
+    order.sort_by_key(|&i| positions[i].y);
+    let first = order[0];
+    let mut canvas = ImageBuffer::from_pixel(canvas_w, canvas_h, Rgb([0, 0, 0]));
+    let mut source_map = SourceMap::new(canvas_w, canvas_h);
+    paste_full(
+        &mut canvas,
+        &mut source_map,
+        &images[first],
+        positions[first],
+        first as u8,
+    );
+
+    for &idx in order.iter().skip(1) {
+        let pos = positions[idx];
+        let overlap = overlap_rect_with_existing(&source_map, pos, w, h);
+        if let Some((x0, y0, x1, y1)) = overlap {
+            let seam = find_vertical_pan_seam(&canvas, &images[idx], pos, x0, y0, x1, y1);
+            paste_with_seam(
+                &mut canvas,
+                &mut source_map,
+                &images[idx],
+                pos,
+                idx as u8,
+                &seam,
+                x0,
+                y0,
+                x1,
+                y1,
+            );
+        } else {
+            paste_full(&mut canvas, &mut source_map, &images[idx], pos, idx as u8);
+        }
+    }
+
+    Ok((canvas, source_map))
+}
+
+fn paste_full(
+    canvas: &mut RgbImage,
+    source_map: &mut SourceMap,
+    img: &RgbImage,
+    pos: Position,
+    source: u8,
+) {
+    for sy in 0..img.height() {
+        for sx in 0..img.width() {
+            let cx = pos.x + sx as i32;
+            let cy = pos.y + sy as i32;
+            if cx >= 0 && cy >= 0 && cx < canvas.width() as i32 && cy < canvas.height() as i32 {
+                canvas.put_pixel(cx as u32, cy as u32, *img.get_pixel(sx, sy));
+                source_map.set(cx as u32, cy as u32, source);
+            }
+        }
+    }
+}
+
+fn overlap_rect_with_existing(
+    source_map: &SourceMap,
+    pos: Position,
+    w: u32,
+    h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let x0 = max(0, pos.x) as u32;
+    let y0 = max(0, pos.y) as u32;
+    let x1 = min(source_map.width as i32, pos.x + w as i32) as u32;
+    let y1 = min(source_map.height as i32, pos.y + h as i32) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let mut min_x = x1;
+    let mut min_y = y1;
+    let mut max_x = x0;
+    let mut max_y = y0;
+    let mut found = false;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if source_map.get(x, y) != SourceMap::UNASSIGNED {
+                found = true;
+                min_x = min(min_x, x);
+                min_y = min(min_y, y);
+                max_x = max(max_x, x);
+                max_y = max(max_y, y);
+            }
+        }
+    }
+    found.then_some((min_x, min_y, max_x + 1, max_y + 1))
+}
+
+fn find_vertical_pan_seam(
+    canvas: &RgbImage,
+    incoming: &RgbImage,
+    pos: Position,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> Vec<u32> {
+    let ow = (x1 - x0) as usize;
+    let oh = (y1 - y0) as usize;
+    if ow == 0 || oh == 0 {
+        return Vec::new();
+    }
+    let mut cost = vec![0.0f32; ow * oh];
+    for yy in 0..oh {
+        for xx in 0..ow {
+            let cx = x0 + xx as u32;
+            let cy = y0 + yy as u32;
+            let sx = (cx as i32 - pos.x) as u32;
+            let sy = (cy as i32 - pos.y) as u32;
+            let a = canvas.get_pixel(cx, cy).0;
+            let b = incoming.get_pixel(sx, sy).0;
+            let color = rgb_abs_diff(a, b);
+            // Prefer seams through places where the two sources agree and avoid strong visible edges.
+            let edge = local_luma_edge(canvas, cx, cy) + local_luma_edge_in(incoming, sx, sy);
+            let margin = yy.min(oh - 1 - yy) as f32;
+            let edge_margin_penalty = if margin < 12.0 {
+                (12.0 - margin) * 8.0
+            } else {
+                0.0
+            };
+            cost[yy * ow + xx] = color + 0.15 * edge + edge_margin_penalty;
+        }
+    }
+
+    let mut dp = vec![0.0f32; ow * oh];
+    let mut back = vec![0i8; ow * oh];
+    for y in 0..oh {
+        dp[y * ow] = cost[y * ow];
+    }
+    for x in 1..ow {
+        for y in 0..oh {
+            let mut best = dp[y * ow + x - 1];
+            let mut best_d = 0i8;
+            if y > 0 {
+                let v = dp[(y - 1) * ow + x - 1] + 1.5;
+                if v < best {
+                    best = v;
+                    best_d = -1;
+                }
+            }
+            if y + 1 < oh {
+                let v = dp[(y + 1) * ow + x - 1] + 1.5;
+                if v < best {
+                    best = v;
+                    best_d = 1;
+                }
+            }
+            dp[y * ow + x] = cost[y * ow + x] + best;
+            back[y * ow + x] = best_d;
+        }
+    }
+
+    let mut seam = vec![0u32; ow];
+    let mut y = (0..oh)
+        .min_by(|&a, &b| dp[a * ow + ow - 1].total_cmp(&dp[b * ow + ow - 1]))
+        .unwrap_or(oh / 2);
+    seam[ow - 1] = y0 + y as u32;
+    for x in (1..ow).rev() {
+        let d = back[y * ow + x];
+        y = match d {
+            -1 => y + 1,
+            1 => y.saturating_sub(1),
+            _ => y,
+        };
+        seam[x - 1] = y0 + y as u32;
+    }
+    seam
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paste_with_seam(
+    canvas: &mut RgbImage,
+    source_map: &mut SourceMap,
+    incoming: &RgbImage,
+    pos: Position,
+    source: u8,
+    seam: &[u32],
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) {
+    for sy in 0..incoming.height() {
+        for sx in 0..incoming.width() {
+            let cx = pos.x + sx as i32;
+            let cy = pos.y + sy as i32;
+            if cx < 0 || cy < 0 || cx >= canvas.width() as i32 || cy >= canvas.height() as i32 {
+                continue;
+            }
+            let cxu = cx as u32;
+            let cyu = cy as u32;
+            let replace = if source_map.get(cxu, cyu) == SourceMap::UNASSIGNED {
+                true
+            } else if cxu >= x0 && cxu < x1 && cyu >= y0 && cyu < y1 {
+                let seam_y = seam[(cxu - x0) as usize];
+                cyu >= seam_y
+            } else {
+                false
+            };
+            if replace {
+                canvas.put_pixel(cxu, cyu, *incoming.get_pixel(sx, sy));
+                source_map.set(cxu, cyu, source);
+            }
+        }
+    }
+}
+
+fn rgb_abs_diff(a: [u8; 3], b: [u8; 3]) -> f32 {
+    ((a[0] as f32 - b[0] as f32).abs()
+        + (a[1] as f32 - b[1] as f32).abs()
+        + (a[2] as f32 - b[2] as f32).abs())
+        / 3.0
+}
+
+fn luma(p: Rgb<u8>) -> f32 {
+    0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32
+}
+
+fn local_luma_edge(img: &RgbImage, x: u32, y: u32) -> f32 {
+    let c = luma(*img.get_pixel(x, y));
+    let mut e: f32 = 0.0;
+    if x > 0 {
+        e = e.max((c - luma(*img.get_pixel(x - 1, y))).abs());
+    }
+    if y > 0 {
+        e = e.max((c - luma(*img.get_pixel(x, y - 1))).abs());
+    }
+    if x + 1 < img.width() {
+        e = e.max((c - luma(*img.get_pixel(x + 1, y))).abs());
+    }
+    if y + 1 < img.height() {
+        e = e.max((c - luma(*img.get_pixel(x, y + 1))).abs());
+    }
+    e
+}
+
+fn local_luma_edge_in(img: &RgbImage, x: u32, y: u32) -> f32 {
+    local_luma_edge(img, x, y)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
