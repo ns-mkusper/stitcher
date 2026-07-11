@@ -714,8 +714,8 @@ fn find_vertical_pan_seam(
     for x in (1..ow).rev() {
         let d = back[y * ow + x];
         y = match d {
-            -1 => y + 1,
-            1 => y.saturating_sub(1),
+            -1 => y.saturating_sub(1),
+            1 => (y + 1).min(oh - 1),
             _ => y,
         };
         seam[x - 1] = y0 + y as u32;
