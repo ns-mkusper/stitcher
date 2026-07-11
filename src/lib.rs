@@ -1354,10 +1354,10 @@ mod tests {
         for y in 0..160 {
             for x in 0..220 {
                 if x < 110 {
-                    img.put_pixel(x, y, Rgb([245, 40, 40]));
+                    img.put_pixel(x, y, Rgb([0, 0, 0]));
                     map.set(x, y, 0);
                 } else {
-                    img.put_pixel(x, y, Rgb([40, 80, 245]));
+                    img.put_pixel(x, y, Rgb([255, 255, 255]));
                     map.set(x, y, 1);
                 }
             }
