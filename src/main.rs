@@ -12,9 +12,10 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use stitcher::{
-    EvalThresholds, PanMode, SourceMap, StitchOptions, StitchReport, detect_duplicates,
-    draw_duplicate_overlay, draw_evaluation_overlay, draw_source_block_overlay, evaluate_stitch,
-    generate_source_map, load_images, stitch_images,
+    EvalThresholds, PanMode, SourceMap, SourceSelection, StitchOptions, StitchReport,
+    detect_duplicates, draw_duplicate_overlay, draw_evaluation_overlay, draw_source_block_overlay,
+    evaluate_stitch, generate_source_map, load_images, stitch_images,
+    stitch_images_with_source_map,
 };
 use tokio::fs;
 use tower_http::services::ServeDir;
@@ -60,6 +61,10 @@ struct StitchArgs {
     /// Pan detection mode.
     #[arg(long, value_enum, default_value_t = CliPanMode::Auto)]
     mode: CliPanMode,
+
+    /// Source selection method for overlaps.
+    #[arg(long, value_enum, default_value_t = CliSourceSelection::NearestCenter)]
+    source_selection: CliSourceSelection,
 
     #[arg(long, default_value_t = 30)]
     min_shift_y: i32,
@@ -152,6 +157,21 @@ impl From<CliPanMode> for PanMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliSourceSelection {
+    NearestCenter,
+    SeamDp,
+}
+
+impl From<CliSourceSelection> for SourceSelection {
+    fn from(value: CliSourceSelection) -> Self {
+        match value {
+            CliSourceSelection::NearestCenter => SourceSelection::NearestCenter,
+            CliSourceSelection::SeamDp => SourceSelection::SeamDp,
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate;
@@ -169,6 +189,7 @@ async fn main() -> Result<()> {
 fn options_from_args(args: &StitchArgs) -> StitchOptions {
     StitchOptions {
         mode: args.mode.into(),
+        source_selection: args.source_selection.into(),
         min_shift_y: args.min_shift_y,
         max_shift_y: args.max_shift_y,
         min_shift_x: args.min_shift_x,
@@ -184,21 +205,14 @@ fn options_from_args(args: &StitchArgs) -> StitchOptions {
 fn stitch_cli(args: StitchArgs) -> Result<()> {
     let images = load_images(&args.inputs).context("loading input images")?;
     let opts = options_from_args(&args);
-    let (stitched, mut report) = stitch_images(&images, &opts).context("stitching images")?;
+    let (stitched, source_map, mut report) =
+        stitch_images_with_source_map(&images, &opts).context("stitching images")?;
     stitched
         .save(&args.output)
         .with_context(|| format!("saving {}", args.output.display()))?;
     println!("wrote {}", args.output.display());
 
     if let Some(path) = &args.source_map {
-        let (input_w, input_h) = images[0].dimensions();
-        let source_map = generate_source_map(
-            &report.normalized_positions,
-            input_w,
-            input_h,
-            report.canvas_width,
-            report.canvas_height,
-        );
         source_map
             .to_gray_image()
             .save(path)
