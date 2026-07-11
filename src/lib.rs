@@ -788,7 +788,7 @@ fn grayscale_vec(img: &RgbImage) -> Vec<f32> {
 }
 
 fn gradient_map(gray: &[f32], w: u32, h: u32) -> Vec<f32> {
-    let mut grad = vec![0.0; (w * h) as usize];
+    let mut grad = vec![0.0f32; (w * h) as usize];
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) as usize;
