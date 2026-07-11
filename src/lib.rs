@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
-use std::cmp::{max, min};
+use std::cmp::{Reverse, max, min};
 use std::collections::VecDeque;
 use std::path::Path;
 
@@ -669,7 +669,7 @@ pub fn evaluate_stitch(
             risk_px,
         });
     }
-    handoff_pairs.sort_by(|a, b| b.risk_px.cmp(&a.risk_px));
+    handoff_pairs.sort_by_key(|pair| Reverse(pair.risk_px));
 
     let mut failures = Vec::new();
     if high_risk_boundary_pixels > thresholds.max_high_risk_boundary_pixels {
@@ -788,7 +788,7 @@ fn grayscale_vec(img: &RgbImage) -> Vec<f32> {
 }
 
 fn gradient_map(gray: &[f32], w: u32, h: u32) -> Vec<f32> {
-    let mut grad = vec![0.0; (w * h) as usize];
+    let mut grad = vec![0.0f32; (w * h) as usize];
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) as usize;
@@ -803,22 +803,14 @@ fn gradient_map(gray: &[f32], w: u32, h: u32) -> Vec<f32> {
     grad
 }
 
-fn source_boundary_map(source_map: &SourceMap) -> (Vec<bool>, Vec<((u8, u8), u32)>) {
+type SourcePair = (u8, u8);
+type SourcePairCount = (SourcePair, u32);
+
+fn source_boundary_map(source_map: &SourceMap) -> (Vec<bool>, Vec<SourcePairCount>) {
     let w = source_map.width;
     let h = source_map.height;
     let mut boundary = vec![false; (w * h) as usize];
-    let mut counts: Vec<((u8, u8), u32)> = Vec::new();
-    let mut add_pair = |a: u8, b: u8| {
-        if a == SourceMap::UNASSIGNED || b == SourceMap::UNASSIGNED || a == b {
-            return;
-        }
-        let pair = if a < b { (a, b) } else { (b, a) };
-        if let Some((_, count)) = counts.iter_mut().find(|(p, _)| *p == pair) {
-            *count += 1;
-        } else {
-            counts.push((pair, 1));
-        }
-    };
+    let mut counts: Vec<SourcePairCount> = Vec::new();
     for y in 0..h {
         for x in 0..w {
             let s = source_map.get(x, y);
@@ -827,7 +819,7 @@ fn source_boundary_map(source_map: &SourceMap) -> (Vec<bool>, Vec<((u8, u8), u32
                 if s != t && s != SourceMap::UNASSIGNED && t != SourceMap::UNASSIGNED {
                     boundary[(y * w + x) as usize] = true;
                     boundary[(y * w + x + 1) as usize] = true;
-                    add_pair(s, t);
+                    add_pair_count(&mut counts, s, t);
                 }
             }
             if y + 1 < h {
@@ -835,14 +827,24 @@ fn source_boundary_map(source_map: &SourceMap) -> (Vec<bool>, Vec<((u8, u8), u32
                 if s != t && s != SourceMap::UNASSIGNED && t != SourceMap::UNASSIGNED {
                     boundary[(y * w + x) as usize] = true;
                     boundary[((y + 1) * w + x) as usize] = true;
-                    add_pair(s, t);
+                    add_pair_count(&mut counts, s, t);
                 }
             }
         }
     }
-    drop(add_pair);
-    let pairs = counts.into_iter().map(|((a, b), c)| ((a, b), c)).collect();
-    (boundary, pairs)
+    (boundary, counts)
+}
+
+fn add_pair_count(counts: &mut Vec<SourcePairCount>, a: u8, b: u8) {
+    if a == SourceMap::UNASSIGNED || b == SourceMap::UNASSIGNED || a == b {
+        return;
+    }
+    let pair = if a < b { (a, b) } else { (b, a) };
+    if let Some((_, count)) = counts.iter_mut().find(|(p, _)| *p == pair) {
+        *count += 1;
+    } else {
+        counts.push((pair, 1));
+    }
 }
 
 fn box_filter(values: &[f32], w: u32, h: u32, radius: i32) -> Vec<f32> {
@@ -924,7 +926,7 @@ fn risky_components(risk: &[bool], grad: &[f32], w: u32, h: u32) -> Vec<RiskyCom
             }
         }
     }
-    components.sort_by(|a, b| b.area_px.cmp(&a.area_px));
+    components.sort_by_key(|component| Reverse(component.area_px));
     components
 }
 
@@ -1352,15 +1354,20 @@ mod tests {
         for y in 0..160 {
             for x in 0..220 {
                 if x < 110 {
-                    img.put_pixel(x, y, Rgb([245, 40, 40]));
+                    img.put_pixel(x, y, Rgb([0, 0, 0]));
                     map.set(x, y, 0);
                 } else {
-                    img.put_pixel(x, y, Rgb([40, 80, 245]));
+                    img.put_pixel(x, y, Rgb([255, 255, 255]));
                     map.set(x, y, 1);
                 }
             }
         }
-        let report = evaluate_stitch(&img, &map, EvalThresholds::default());
+        let thresholds = EvalThresholds {
+            max_high_risk_boundary_pixels: 0,
+            max_largest_risky_component_area: 0,
+            ..Default::default()
+        };
+        let report = evaluate_stitch(&img, &map, thresholds);
         assert!(!report.passed);
         assert!(report.high_risk_boundary_pixels > 0);
         assert!(report.largest_risky_component_area > 0);
