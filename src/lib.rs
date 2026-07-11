@@ -1,17 +1,18 @@
 use anyhow::{Result, bail};
-use image::{DynamicImage, ImageBuffer, Rgb, RgbImage};
-use serde::Serialize;
+use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
+use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
+use std::collections::VecDeque;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PanMode {
     Auto,
     Vertical,
     Horizontal,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Shift {
     /// Content displacement on screen from previous frame to this frame.
     /// Positive dx means content appears farther right in the later frame.
@@ -21,13 +22,13 @@ pub struct Shift {
     pub score: f32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Position {
     pub x: i32,
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateBand {
     pub score: f32,
     pub y1: u32,
@@ -35,21 +36,21 @@ pub struct DuplicateBand {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicatePatch {
     pub score: f32,
     pub rect_a: [u32; 4],
     pub rect_b: [u32; 4],
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateReport {
     pub passed: bool,
     pub band_duplicates: Vec<DuplicateBand>,
     pub patch_duplicates: Vec<DuplicatePatch>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StitchReport {
     pub shifts: Vec<Shift>,
     pub raw_positions: Vec<Position>,
@@ -499,6 +500,495 @@ pub fn synthesize_nearest_center(
     Ok(out)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceMap {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+impl SourceMap {
+    pub const UNASSIGNED: u8 = u8::MAX;
+
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            data: vec![Self::UNASSIGNED; (width * height) as usize],
+        }
+    }
+
+    pub fn get(&self, x: u32, y: u32) -> u8 {
+        self.data[(y * self.width + x) as usize]
+    }
+
+    pub fn set(&mut self, x: u32, y: u32, value: u8) {
+        self.data[(y * self.width + x) as usize] = value;
+    }
+
+    pub fn to_gray_image(&self) -> GrayImage {
+        let mut img = GrayImage::new(self.width, self.height);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let v = self.get(x, y);
+                img.put_pixel(x, y, Luma([if v == Self::UNASSIGNED { 0 } else { v + 1 }]));
+            }
+        }
+        img
+    }
+
+    pub fn from_gray_image(img: &GrayImage) -> Self {
+        let (width, height) = img.dimensions();
+        let mut map = Self::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let p = img.get_pixel(x, y).0[0];
+                map.set(x, y, if p == 0 { Self::UNASSIGNED } else { p - 1 });
+            }
+        }
+        map
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct EvalThresholds {
+    pub max_high_risk_boundary_pixels: u32,
+    pub max_largest_risky_component_area: u32,
+    pub max_duplicate_bands: usize,
+    pub max_duplicate_patches: usize,
+}
+
+impl Default for EvalThresholds {
+    fn default() -> Self {
+        Self {
+            max_high_risk_boundary_pixels: 250,
+            max_largest_risky_component_area: 300,
+            max_duplicate_bands: 0,
+            max_duplicate_patches: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskyComponent {
+    pub area_px: u32,
+    pub bbox_xywh: [u32; 4],
+    pub mean_gradient: f32,
+    pub max_gradient: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffPairReport {
+    pub sources: [u8; 2],
+    pub boundary_px: u32,
+    pub risk_px: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluationReport {
+    pub passed: bool,
+    pub image_size: [u32; 2],
+    pub boundary_pixels: u32,
+    pub high_risk_boundary_pixels: u32,
+    pub largest_risky_component_area: u32,
+    pub high_risk_components: Vec<RiskyComponent>,
+    pub handoff_pairs: Vec<HandoffPairReport>,
+    pub duplicate_report: DuplicateReport,
+    pub thresholds: EvalThresholds,
+    pub failures: Vec<String>,
+}
+
+pub fn generate_source_map(
+    positions: &[Position],
+    input_width: u32,
+    input_height: u32,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> SourceMap {
+    let mut map = SourceMap::new(canvas_width, canvas_height);
+    let center_x = input_width as f32 / 2.0;
+    let center_y = input_height as f32 / 2.0;
+    for cy in 0..canvas_height as i32 {
+        for cx in 0..canvas_width as i32 {
+            let mut best: Option<(f32, u8)> = None;
+            for (i, p) in positions.iter().enumerate() {
+                let sx = cx - p.x;
+                let sy = cy - p.y;
+                if sx >= 0 && sy >= 0 && sx < input_width as i32 && sy < input_height as i32 {
+                    let score = ((sx as f32 - center_x).powi(2) + (sy as f32 - center_y).powi(2))
+                        .sqrt()
+                        - i as f32 * 0.01;
+                    if best.map(|b| score < b.0).unwrap_or(true) {
+                        best = Some((score, i as u8));
+                    }
+                }
+            }
+            if let Some((_, source)) = best {
+                map.set(cx as u32, cy as u32, source);
+            }
+        }
+    }
+    map
+}
+
+pub fn evaluate_stitch(
+    stitched: &RgbImage,
+    source_map: &SourceMap,
+    thresholds: EvalThresholds,
+) -> EvaluationReport {
+    let (w, h) = stitched.dimensions();
+    assert_eq!((w, h), (source_map.width, source_map.height));
+    let gray = grayscale_vec(stitched);
+    let grad = gradient_map(&gray, w, h);
+    let (boundary, handoff_counts) = source_boundary_map(source_map);
+    let local = box_filter(&grad, w, h, 10);
+
+    let mut risk = vec![false; (w * h) as usize];
+    let mut boundary_pixels = 0u32;
+    let mut high_risk_boundary_pixels = 0u32;
+    for idx in 0..risk.len() {
+        if boundary[idx] {
+            boundary_pixels += 1;
+            if grad[idx] > 28.0 || grad[idx] - local[idx] > 18.0 {
+                risk[idx] = true;
+                high_risk_boundary_pixels += 1;
+            }
+        }
+    }
+
+    let components = risky_components(&risk, &grad, w, h);
+    let largest = components.first().map(|c| c.area_px).unwrap_or(0);
+    let duplicate_report = detect_duplicates(stitched);
+
+    let mut handoff_pairs = Vec::new();
+    for ((a, b), boundary_px) in handoff_counts {
+        let risk_px = count_pair_risk(source_map, &risk, a, b);
+        handoff_pairs.push(HandoffPairReport {
+            sources: [a, b],
+            boundary_px,
+            risk_px,
+        });
+    }
+    handoff_pairs.sort_by(|a, b| b.risk_px.cmp(&a.risk_px));
+
+    let mut failures = Vec::new();
+    if high_risk_boundary_pixels > thresholds.max_high_risk_boundary_pixels {
+        failures.push(format!(
+            "high_risk_boundary_pixels {} > {}",
+            high_risk_boundary_pixels, thresholds.max_high_risk_boundary_pixels
+        ));
+    }
+    if largest > thresholds.max_largest_risky_component_area {
+        failures.push(format!(
+            "largest_risky_component_area {} > {}",
+            largest, thresholds.max_largest_risky_component_area
+        ));
+    }
+    if duplicate_report.band_duplicates.len() > thresholds.max_duplicate_bands {
+        failures.push(format!(
+            "duplicate_bands {} > {}",
+            duplicate_report.band_duplicates.len(),
+            thresholds.max_duplicate_bands
+        ));
+    }
+    if duplicate_report.patch_duplicates.len() > thresholds.max_duplicate_patches {
+        failures.push(format!(
+            "duplicate_patches {} > {}",
+            duplicate_report.patch_duplicates.len(),
+            thresholds.max_duplicate_patches
+        ));
+    }
+
+    EvaluationReport {
+        passed: failures.is_empty(),
+        image_size: [w, h],
+        boundary_pixels,
+        high_risk_boundary_pixels,
+        largest_risky_component_area: largest,
+        high_risk_components: components,
+        handoff_pairs,
+        duplicate_report,
+        thresholds,
+        failures,
+    }
+}
+
+pub fn draw_evaluation_overlay(
+    stitched: &RgbImage,
+    source_map: &SourceMap,
+    report: &EvaluationReport,
+) -> RgbImage {
+    let (w, h) = stitched.dimensions();
+    let gray = grayscale_vec(stitched);
+    let grad = gradient_map(&gray, w, h);
+    let (boundary, _) = source_boundary_map(source_map);
+    let local = box_filter(&grad, w, h, 10);
+    let mut out = stitched.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            if boundary[idx] {
+                out.put_pixel(x, y, Rgb([255, 230, 0]));
+                if grad[idx] > 28.0 || grad[idx] - local[idx] > 18.0 {
+                    draw_point_thick(&mut out, x, y, Rgb([255, 0, 0]), 2);
+                }
+            }
+        }
+    }
+    for c in &report.high_risk_components {
+        let [x, y, ww, hh] = c.bbox_xywh;
+        if ww > 0 && hh > 0 {
+            draw_rect(&mut out, x, y, x + ww - 1, y + hh - 1, Rgb([255, 0, 0]));
+        }
+    }
+    out
+}
+
+pub fn draw_source_block_overlay(stitched: &RgbImage, source_map: &SourceMap) -> RgbImage {
+    let colors = [
+        Rgb([255, 70, 70]),
+        Rgb([70, 160, 255]),
+        Rgb([70, 255, 120]),
+        Rgb([255, 220, 70]),
+        Rgb([210, 90, 255]),
+        Rgb([255, 130, 40]),
+        Rgb([40, 255, 240]),
+    ];
+    let mut out = stitched.clone();
+    for y in 0..stitched.height() {
+        for x in 0..stitched.width() {
+            let s = source_map.get(x, y);
+            if s == SourceMap::UNASSIGNED {
+                continue;
+            }
+            let c = colors[s as usize % colors.len()].0;
+            let p = out.get_pixel_mut(x, y);
+            p.0 = [
+                ((p.0[0] as u16 * 70 + c[0] as u16 * 30) / 100) as u8,
+                ((p.0[1] as u16 * 70 + c[1] as u16 * 30) / 100) as u8,
+                ((p.0[2] as u16 * 70 + c[2] as u16 * 30) / 100) as u8,
+            ];
+        }
+    }
+    let (boundary, _) = source_boundary_map(source_map);
+    for y in 0..stitched.height() {
+        for x in 0..stitched.width() {
+            if boundary[(y * stitched.width() + x) as usize] {
+                out.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+    }
+    out
+}
+
+fn grayscale_vec(img: &RgbImage) -> Vec<f32> {
+    img.pixels()
+        .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+        .collect()
+}
+
+fn gradient_map(gray: &[f32], w: u32, h: u32) -> Vec<f32> {
+    let mut grad = vec![0.0; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            if x > 0 {
+                grad[idx] = grad[idx].max((gray[idx] - gray[(y * w + x - 1) as usize]).abs());
+            }
+            if y > 0 {
+                grad[idx] = grad[idx].max((gray[idx] - gray[((y - 1) * w + x) as usize]).abs());
+            }
+        }
+    }
+    grad
+}
+
+fn source_boundary_map(source_map: &SourceMap) -> (Vec<bool>, Vec<((u8, u8), u32)>) {
+    let w = source_map.width;
+    let h = source_map.height;
+    let mut boundary = vec![false; (w * h) as usize];
+    let mut counts: Vec<((u8, u8), u32)> = Vec::new();
+    let mut add_pair = |a: u8, b: u8| {
+        if a == SourceMap::UNASSIGNED || b == SourceMap::UNASSIGNED || a == b {
+            return;
+        }
+        let pair = if a < b { (a, b) } else { (b, a) };
+        if let Some((_, count)) = counts.iter_mut().find(|(p, _)| *p == pair) {
+            *count += 1;
+        } else {
+            counts.push((pair, 1));
+        }
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let s = source_map.get(x, y);
+            if x + 1 < w {
+                let t = source_map.get(x + 1, y);
+                if s != t && s != SourceMap::UNASSIGNED && t != SourceMap::UNASSIGNED {
+                    boundary[(y * w + x) as usize] = true;
+                    boundary[(y * w + x + 1) as usize] = true;
+                    add_pair(s, t);
+                }
+            }
+            if y + 1 < h {
+                let t = source_map.get(x, y + 1);
+                if s != t && s != SourceMap::UNASSIGNED && t != SourceMap::UNASSIGNED {
+                    boundary[(y * w + x) as usize] = true;
+                    boundary[((y + 1) * w + x) as usize] = true;
+                    add_pair(s, t);
+                }
+            }
+        }
+    }
+    drop(add_pair);
+    let pairs = counts.into_iter().map(|((a, b), c)| ((a, b), c)).collect();
+    (boundary, pairs)
+}
+
+fn box_filter(values: &[f32], w: u32, h: u32, radius: i32) -> Vec<f32> {
+    let ww = w as usize;
+    let hh = h as usize;
+    let mut integral = vec![0.0f64; (ww + 1) * (hh + 1)];
+    for y in 0..hh {
+        let mut row_sum = 0.0f64;
+        for x in 0..ww {
+            row_sum += values[y * ww + x] as f64;
+            integral[(y + 1) * (ww + 1) + x + 1] = integral[y * (ww + 1) + x + 1] + row_sum;
+        }
+    }
+
+    let mut out = vec![0.0; values.len()];
+    for y in 0..hh {
+        for x in 0..ww {
+            let x0 = x.saturating_sub(radius as usize);
+            let y0 = y.saturating_sub(radius as usize);
+            let x1 = min(ww - 1, x + radius as usize);
+            let y1 = min(hh - 1, y + radius as usize);
+            let xa = x0;
+            let xb = x1 + 1;
+            let ya = y0;
+            let yb = y1 + 1;
+            let sum = integral[yb * (ww + 1) + xb]
+                - integral[ya * (ww + 1) + xb]
+                - integral[yb * (ww + 1) + xa]
+                + integral[ya * (ww + 1) + xa];
+            let n = ((x1 - x0 + 1) * (y1 - y0 + 1)) as f64;
+            out[y * ww + x] = (sum / n) as f32;
+        }
+    }
+    out
+}
+
+fn risky_components(risk: &[bool], grad: &[f32], w: u32, h: u32) -> Vec<RiskyComponent> {
+    let mut seen = vec![false; risk.len()];
+    let mut components = Vec::new();
+    for y0 in 0..h {
+        for x0 in 0..w {
+            let idx0 = (y0 * w + x0) as usize;
+            if !risk[idx0] || seen[idx0] {
+                continue;
+            }
+            let mut q = VecDeque::from([(x0, y0)]);
+            seen[idx0] = true;
+            let mut area = 0u32;
+            let mut min_x = x0;
+            let mut max_x = x0;
+            let mut min_y = y0;
+            let mut max_y = y0;
+            let mut sum_grad = 0.0;
+            let mut max_grad = 0.0f32;
+            while let Some((x, y)) = q.pop_front() {
+                let idx = (y * w + x) as usize;
+                area += 1;
+                min_x = min(min_x, x);
+                max_x = max(max_x, x);
+                min_y = min(min_y, y);
+                max_y = max(max_y, y);
+                sum_grad += grad[idx];
+                max_grad = max_grad.max(grad[idx]);
+                for (nx, ny) in neighbors4(x, y, w, h) {
+                    let nidx = (ny * w + nx) as usize;
+                    if risk[nidx] && !seen[nidx] {
+                        seen[nidx] = true;
+                        q.push_back((nx, ny));
+                    }
+                }
+            }
+            if area >= 40 {
+                components.push(RiskyComponent {
+                    area_px: area,
+                    bbox_xywh: [min_x, min_y, max_x - min_x + 1, max_y - min_y + 1],
+                    mean_gradient: sum_grad / area as f32,
+                    max_gradient: max_grad,
+                });
+            }
+        }
+    }
+    components.sort_by(|a, b| b.area_px.cmp(&a.area_px));
+    components
+}
+
+fn count_pair_risk(source_map: &SourceMap, risk: &[bool], a: u8, b: u8) -> u32 {
+    let w = source_map.width;
+    let h = source_map.height;
+    let mut count = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let s = source_map.get(x, y);
+            if x + 1 < w {
+                let t = source_map.get(x + 1, y);
+                if pair_eq(s, t, a, b)
+                    && (risk[(y * w + x) as usize] || risk[(y * w + x + 1) as usize])
+                {
+                    count += 1;
+                }
+            }
+            if y + 1 < h {
+                let t = source_map.get(x, y + 1);
+                if pair_eq(s, t, a, b)
+                    && (risk[(y * w + x) as usize] || risk[((y + 1) * w + x) as usize])
+                {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+fn pair_eq(s: u8, t: u8, a: u8, b: u8) -> bool {
+    (s == a && t == b) || (s == b && t == a)
+}
+
+fn neighbors4(x: u32, y: u32, w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
+    let mut v = Vec::with_capacity(4);
+    if x > 0 {
+        v.push((x - 1, y));
+    }
+    if y > 0 {
+        v.push((x, y - 1));
+    }
+    if x + 1 < w {
+        v.push((x + 1, y));
+    }
+    if y + 1 < h {
+        v.push((x, y + 1));
+    }
+    v.into_iter()
+}
+
+fn draw_point_thick(img: &mut RgbImage, x: u32, y: u32, color: Rgb<u8>, radius: u32) {
+    let x0 = x.saturating_sub(radius);
+    let y0 = y.saturating_sub(radius);
+    let x1 = min(img.width() - 1, x + radius);
+    let y1 = min(img.height() - 1, y + radius);
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            img.put_pixel(xx, yy, color);
+        }
+    }
+}
+
 pub fn detect_duplicates(img: &RgbImage) -> DuplicateReport {
     let bands = detect_duplicate_bands(img);
     let patches = detect_duplicate_patches(img);
@@ -835,5 +1325,58 @@ mod tests {
                 .all(|s| s.dy < -110 && s.dy > -190 && s.dx.abs() <= 4)
         );
         assert_eq!(report.canvas_height, 700);
+    }
+
+    #[test]
+    fn eval_passes_clean_single_source_image() {
+        let img = synthetic_canvas(220, 160);
+        let mut map = SourceMap::new(220, 160);
+        for y in 0..160 {
+            for x in 0..220 {
+                map.set(x, y, 0);
+            }
+        }
+        let report = evaluate_stitch(&img, &map, EvalThresholds::default());
+        assert!(
+            report.passed,
+            "unexpected eval failures: {:?}",
+            report.failures
+        );
+        assert_eq!(report.boundary_pixels, 0);
+    }
+
+    #[test]
+    fn eval_fails_visible_source_block_seam() {
+        let mut img = RgbImage::new(220, 160);
+        let mut map = SourceMap::new(220, 160);
+        for y in 0..160 {
+            for x in 0..220 {
+                if x < 110 {
+                    img.put_pixel(x, y, Rgb([245, 40, 40]));
+                    map.set(x, y, 0);
+                } else {
+                    img.put_pixel(x, y, Rgb([40, 80, 245]));
+                    map.set(x, y, 1);
+                }
+            }
+        }
+        let report = evaluate_stitch(&img, &map, EvalThresholds::default());
+        assert!(!report.passed);
+        assert!(report.high_risk_boundary_pixels > 0);
+        assert!(report.largest_risky_component_area > 0);
+    }
+
+    #[test]
+    fn source_map_round_trips_through_png_values() {
+        let mut map = SourceMap::new(3, 2);
+        map.set(0, 0, 0);
+        map.set(1, 0, 1);
+        map.set(2, 1, 6);
+        let image = map.to_gray_image();
+        let roundtrip = SourceMap::from_gray_image(&image);
+        assert_eq!(roundtrip.get(0, 0), 0);
+        assert_eq!(roundtrip.get(1, 0), 1);
+        assert_eq!(roundtrip.get(2, 1), 6);
+        assert_eq!(roundtrip.get(2, 0), SourceMap::UNASSIGNED);
     }
 }
