@@ -723,6 +723,7 @@ fn find_vertical_pan_seam(
     seam
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paste_with_seam(
     canvas: &mut RgbImage,
     source_map: &mut SourceMap,
