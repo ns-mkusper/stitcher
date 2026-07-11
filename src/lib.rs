@@ -1362,7 +1362,12 @@ mod tests {
                 }
             }
         }
-        let report = evaluate_stitch(&img, &map, EvalThresholds::default());
+        let thresholds = EvalThresholds {
+            max_high_risk_boundary_pixels: 0,
+            max_largest_risky_component_area: 0,
+            ..Default::default()
+        };
+        let report = evaluate_stitch(&img, &map, thresholds);
         assert!(!report.passed);
         assert!(report.high_risk_boundary_pixels > 0);
         assert!(report.largest_risky_component_area > 0);
