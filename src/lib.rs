@@ -850,6 +850,8 @@ pub struct EvalThresholds {
     pub max_largest_risky_component_area: u32,
     pub max_duplicate_bands: usize,
     pub max_duplicate_patches: usize,
+    /// Minimum average luminance-gradient energy. Set to 0 to disable.
+    pub min_mean_gradient: f32,
 }
 
 impl Default for EvalThresholds {
@@ -859,6 +861,7 @@ impl Default for EvalThresholds {
             max_largest_risky_component_area: 300,
             max_duplicate_bands: 0,
             max_duplicate_patches: 0,
+            min_mean_gradient: 0.0,
         }
     }
 }
@@ -889,6 +892,8 @@ pub struct EvaluationReport {
     pub handoff_pairs: Vec<HandoffPairReport>,
     pub duplicate_report: DuplicateReport,
     pub thresholds: EvalThresholds,
+    pub source_map_distinct_sources: usize,
+    pub mean_gradient: f32,
     pub failures: Vec<String>,
 }
 
@@ -936,6 +941,12 @@ pub fn evaluate_stitch(
     let grad = gradient_map(&gray, w, h);
     let (boundary, handoff_counts) = source_boundary_map(source_map);
     let local = box_filter(&grad, w, h, 10);
+    let source_map_distinct_sources = distinct_assigned_sources(source_map);
+    let mean_gradient = if grad.is_empty() {
+        0.0
+    } else {
+        grad.iter().sum::<f32>() / grad.len() as f32
+    };
 
     let mut risk = vec![false; (w * h) as usize];
     let mut boundary_pixels = 0u32;
@@ -1003,6 +1014,8 @@ pub fn evaluate_stitch(
         handoff_pairs,
         duplicate_report,
         thresholds,
+        source_map_distinct_sources,
+        mean_gradient,
         failures,
     }
 }
@@ -1099,6 +1112,16 @@ fn gradient_map(gray: &[f32], w: u32, h: u32) -> Vec<f32> {
 
 type SourcePair = (u8, u8);
 type SourcePairCount = (SourcePair, u32);
+
+fn distinct_assigned_sources(source_map: &SourceMap) -> usize {
+    let mut seen = [false; 256];
+    for &value in &source_map.data {
+        if value != SourceMap::UNASSIGNED {
+            seen[value as usize] = true;
+        }
+    }
+    seen.into_iter().filter(|v| *v).count()
+}
 
 fn source_boundary_map(source_map: &SourceMap) -> (Vec<bool>, Vec<SourcePairCount>) {
     let w = source_map.width;
@@ -1679,5 +1702,30 @@ mod tests {
         assert_eq!(roundtrip.get(1, 0), 1);
         assert_eq!(roundtrip.get(2, 1), 6);
         assert_eq!(roundtrip.get(2, 0), SourceMap::UNASSIGNED);
+    }
+
+    #[test]
+    fn eval_can_reject_blur_to_pass_outputs() {
+        let sharp = synthetic_canvas(180, 120);
+        let blurred = image::imageops::blur(&sharp, 5.0);
+        let mut map = SourceMap::new(180, 120);
+        for y in 0..120 {
+            for x in 0..180 {
+                map.set(x, y, 0);
+            }
+        }
+        let sharp_report = evaluate_stitch(&sharp, &map, EvalThresholds::default());
+        let thresholds = EvalThresholds {
+            min_mean_gradient: sharp_report.mean_gradient * 0.75,
+            ..Default::default()
+        };
+        let blurred_report = evaluate_stitch(&blurred, &map, thresholds);
+        assert!(!blurred_report.passed);
+        assert!(
+            blurred_report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("mean_gradient"))
+        );
     }
 }
