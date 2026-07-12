@@ -99,6 +99,14 @@ struct StitchArgs {
     #[arg(long, default_value_t = 12.0)]
     seam_motion_threshold: f32,
 
+    /// Dilate detected moving-foreground seam mask by this many pixels. Set to 0 to disable.
+    #[arg(long, default_value_t = 0)]
+    seam_motion_mask_dilate: u32,
+
+    /// Hard seam penalty inside the dilated moving-foreground mask. Set to 0 to disable.
+    #[arg(long, default_value_t = 0.0)]
+    seam_motion_hard_penalty: f32,
+
     /// Weight for avoiding strong luminance edges in seam search.
     #[arg(long, default_value_t = 0.15)]
     seam_edge_weight: f32,
@@ -249,6 +257,8 @@ fn options_from_args(args: &StitchArgs) -> StitchOptions {
         seam_motion_weight: args.seam_motion_weight,
         seam_motion_radius: args.seam_motion_radius,
         seam_motion_threshold: args.seam_motion_threshold,
+        seam_motion_mask_dilate: args.seam_motion_mask_dilate,
+        seam_motion_hard_penalty: args.seam_motion_hard_penalty,
         seam_edge_weight: args.seam_edge_weight,
     }
 }

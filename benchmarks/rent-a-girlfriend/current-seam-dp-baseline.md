@@ -362,3 +362,86 @@ monotonic + snap-x 40:
 ```
 
 Assessment: this is the best current output by the hardened metrics and directly targets visible uneven background seams caused by horizontal jitter. It does not crop the vertical pan; the width returns to the native frame width because the previous extra width came from small estimated x drift in a vertical pan. The duplicate patch failures remain; inspection shows the reported duplicate patches are entirely inside source frame 6 / the top source region, so they may be source-inherent repeated background rather than a duplicate introduced by stitching. Do not suppress that gate with source-map tricks; future evaluator work should distinguish source-inherent duplicates using the original inputs, not the stitched source map.
+
+## Foreground/motion hard-mask seam experiment
+
+A general foreground-protection seam constraint was added for `seam-dp-motion`. It does **not** hardcode this image, skin colors, hands, pockets, or crop coordinates. It builds a moving-foreground mask from temporal disagreement between all frames covering the candidate seam pixel, dilates that mask, and adds a hard seam penalty inside it.
+
+New knobs:
+
+```bash
+--seam-motion-mask-dilate <px>
+--seam-motion-hard-penalty <cost>
+```
+
+The existing soft local motion term only compares the currently pasted source with the incoming frame. The hard-mask version also checks multi-frame disagreement, which catches regions that look stable between an adjacent pair but are inconsistent across the full stack.
+
+Best metric-oriented run from the sweep:
+
+```bash
+stitcher stitch \
+  --mode vertical \
+  --source-selection seam-dp-motion \
+  --monotonic-frame-filter \
+  --min-shift-y 20 \
+  --max-drift-x 40 \
+  --snap-x 40 \
+  --seam-motion-radius 4 \
+  --seam-motion-threshold 30 \
+  --seam-motion-mask-dilate 4 \
+  --seam-motion-hard-penalty 100 \
+  --output t30_d4_p100.png \
+  --report t30_d4_p100_report.json \
+  --source-map t30_d4_p100_source.png \
+  <timestamp-ordered frames>
+```
+
+Artifacts:
+
+```text
+/workspace/rent-a-girlfriend/stitches/foreground_multiframe_mask_sweep/t30_d4_p100.png
+/workspace/rent-a-girlfriend/stitches/foreground_multiframe_mask_sweep/t30_d4_p100_source.png
+/workspace/rent-a-girlfriend/stitches/foreground_multiframe_mask_sweep/t30_d4_p100_overlay.png
+/workspace/rent-a-girlfriend/stitches/foreground_multiframe_mask_sweep/t30_d4_p100_source_blocks.png
+/workspace/rent-a-girlfriend/stitches/foreground_multiframe_mask_sweep/t30_d4_p100_crops/
+```
+
+Metrics:
+
+```text
+passed: false
+boundary_pixels: 17915
+high_risk_boundary_pixels: 2009
+largest_risky_component_area: 133
+duplicate_patches: 2
+failures:
+  - high_risk_boundary_pixels 2009 > 250
+  - duplicate_patches 2 > 0
+```
+
+Comparison to previous best (`monotonic + snap-x 40`):
+
+```text
+boundary_pixels:           17735 -> 17915  (+180)
+high_risk_boundary_pixels:  2075 -> 2009   (-66)
+largest_risky_component:     125 -> 133    (+8)
+duplicate_patches:             2 -> 2
+lower hand/pocket seam px:    199 -> 107
+upper waist seam px:         3127 -> 2669
+full body-middle seam px:    7299 -> 6982
+```
+
+Best hand/pocket-protection run:
+
+```text
+t80_d16_p100:
+boundary_pixels: 16125
+high_risk_boundary_pixels: 2042
+largest_risky_component_area: 255
+duplicate_patches: 2
+lower hand/pocket seam px: 0
+```
+
+Assessment: the general foreground mask does what it was intended to do: it can reduce or eliminate the diagonal hand/pocket source boundary without blur/crop/fake maps. The best balanced setting (`t30_d4_p100`) slightly improves the hardened metric and cuts the hand/pocket seam roughly in half. A more aggressive setting (`t80_d16_p100`) eliminates the lower pocket seam entirely, but it moves cost elsewhere and grows the largest risky component, so it is not clearly better overall.
+
+The remaining duplicate-patch failures are unchanged. They still appear to be in repeated top/background source content rather than the foreground hand seam. The next algorithmic step should be global label optimization or a true graph-cut style source assignment that can jointly optimize foreground protection, seam length, source order, and background duplicate avoidance.
