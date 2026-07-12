@@ -84,6 +84,8 @@ pub struct StitchOptions {
     pub seam_motion_weight: f32,
     pub seam_motion_radius: u32,
     pub seam_motion_threshold: f32,
+    pub seam_motion_mask_dilate: u32,
+    pub seam_motion_hard_penalty: f32,
     pub seam_edge_weight: f32,
 }
 
@@ -105,6 +107,8 @@ impl Default for StitchOptions {
             seam_motion_weight: 2.0,
             seam_motion_radius: 6,
             seam_motion_threshold: 12.0,
+            seam_motion_mask_dilate: 0,
+            seam_motion_hard_penalty: 0.0,
             seam_edge_weight: 0.15,
         }
     }
@@ -193,6 +197,8 @@ pub fn stitch_images_with_source_map(
                 opts.seam_motion_weight,
                 opts.seam_motion_radius,
                 opts.seam_motion_threshold,
+                opts.seam_motion_mask_dilate,
+                opts.seam_motion_hard_penalty,
                 opts.seam_edge_weight,
             ),
             active_sources,
@@ -633,6 +639,8 @@ struct SeamOptions {
     motion_weight: f32,
     motion_radius: u32,
     motion_threshold: f32,
+    motion_mask_dilate: u32,
+    motion_hard_penalty: f32,
     edge_weight: f32,
 }
 
@@ -641,6 +649,8 @@ impl SeamOptions {
         motion_weight: 0.0,
         motion_radius: 0,
         motion_threshold: 0.0,
+        motion_mask_dilate: 0,
+        motion_hard_penalty: 0.0,
         edge_weight: 0.15,
     };
 
@@ -648,12 +658,16 @@ impl SeamOptions {
         motion_weight: f32,
         motion_radius: u32,
         motion_threshold: f32,
+        motion_mask_dilate: u32,
+        motion_hard_penalty: f32,
         edge_weight: f32,
     ) -> Self {
         Self {
             motion_weight,
             motion_radius,
             motion_threshold,
+            motion_mask_dilate,
+            motion_hard_penalty,
             edge_weight,
         }
     }
@@ -686,7 +700,7 @@ pub fn synthesize_vertical_seams_motion_with_source_map(
         positions,
         canvas_w,
         canvas_h,
-        SeamOptions::motion_aware(2.0, 6, 12.0, 0.15),
+        SeamOptions::motion_aware(2.0, 6, 12.0, 0, 0.0, 0.15),
         None,
     )
 }
@@ -870,6 +884,23 @@ fn find_vertical_pan_seam(
     if ow == 0 || oh == 0 {
         return Vec::new();
     }
+    let hard_motion_mask = if seam_options.motion_hard_penalty > 0.0 {
+        motion_mask_for_overlap(
+            source_map,
+            images,
+            positions,
+            incoming_idx,
+            x0,
+            y0,
+            ow,
+            oh,
+            seam_options.motion_radius,
+            seam_options.motion_threshold,
+            seam_options.motion_mask_dilate,
+        )
+    } else {
+        vec![false; ow * oh]
+    };
     let mut cost = vec![0.0f32; ow * oh];
     for yy in 0..oh {
         for xx in 0..ow {
@@ -903,10 +934,16 @@ fn find_vertical_pan_seam(
             } else {
                 0.0
             };
+            let hard_motion = if hard_motion_mask[yy * ow + xx] {
+                seam_options.motion_hard_penalty
+            } else {
+                0.0
+            };
             cost[yy * ow + xx] = color
                 + seam_options.edge_weight * edge
                 + edge_margin_penalty
-                + seam_options.motion_weight * motion;
+                + seam_options.motion_weight * motion
+                + hard_motion;
         }
     }
 
@@ -990,6 +1027,118 @@ fn paste_with_seam(
                 source_map.set(cxu, cyu, source);
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn motion_mask_for_overlap(
+    source_map: &SourceMap,
+    images: &[RgbImage],
+    positions: &[Position],
+    incoming_idx: usize,
+    x0: u32,
+    y0: u32,
+    ow: usize,
+    oh: usize,
+    radius: u32,
+    threshold: f32,
+    dilate: u32,
+) -> Vec<bool> {
+    let mut mask = vec![false; ow * oh];
+    for yy in 0..oh {
+        for xx in 0..ow {
+            let cx = x0 + xx as u32;
+            let cy = y0 + yy as u32;
+            let existing_source = source_map.get(cx, cy);
+            if existing_source == SourceMap::UNASSIGNED {
+                continue;
+            }
+            let adjacent_diff = aligned_temporal_diff(
+                images,
+                positions,
+                existing_source,
+                incoming_idx,
+                cx,
+                cy,
+                radius,
+            );
+            let temporal_diff = covering_temporal_disagreement(images, positions, cx, cy, radius);
+            let diff = adjacent_diff.max(temporal_diff);
+            if diff > threshold {
+                mask[yy * ow + xx] = true;
+            }
+        }
+    }
+    dilate_bool_mask(&mask, ow, oh, dilate as usize)
+}
+
+fn dilate_bool_mask(mask: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
+    if radius == 0 || mask.is_empty() {
+        return mask.to_vec();
+    }
+    let mut out = mask.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            if !mask[y * w + x] {
+                continue;
+            }
+            let y0 = y.saturating_sub(radius);
+            let y1 = min(h - 1, y + radius);
+            let x0 = x.saturating_sub(radius);
+            let x1 = min(w - 1, x + radius);
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    out[yy * w + xx] = true;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn covering_temporal_disagreement(
+    images: &[RgbImage],
+    positions: &[Position],
+    cx: u32,
+    cy: u32,
+    radius: u32,
+) -> f32 {
+    let radius = radius as i32;
+    let mut total = 0.0;
+    let mut count = 0u32;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let sample_x = cx as i32 + dx;
+            let sample_y = cy as i32 + dy;
+            let mut min_rgb = [u8::MAX; 3];
+            let mut max_rgb = [u8::MIN; 3];
+            let mut covered = 0u32;
+            for (idx, img) in images.iter().enumerate() {
+                let sx = sample_x - positions[idx].x;
+                let sy = sample_y - positions[idx].y;
+                if sx < 0 || sy < 0 || sx >= img.width() as i32 || sy >= img.height() as i32 {
+                    continue;
+                }
+                let p = img.get_pixel(sx as u32, sy as u32).0;
+                for c in 0..3 {
+                    min_rgb[c] = min_rgb[c].min(p[c]);
+                    max_rgb[c] = max_rgb[c].max(p[c]);
+                }
+                covered += 1;
+            }
+            if covered >= 2 {
+                total += ((max_rgb[0] as f32 - min_rgb[0] as f32).abs()
+                    + (max_rgb[1] as f32 - min_rgb[1] as f32).abs()
+                    + (max_rgb[2] as f32 - min_rgb[2] as f32).abs())
+                    / 3.0;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f32
     }
 }
 
@@ -1994,6 +2143,39 @@ mod tests {
     }
 
     #[test]
+    fn motion_mask_dilation_expands_foreground_barrier() {
+        let mut mask = vec![false; 25];
+        mask[2 * 5 + 2] = true;
+        let dilated = dilate_bool_mask(&mask, 5, 5, 1);
+        let count = dilated.iter().filter(|&&v| v).count();
+        assert_eq!(count, 9);
+        assert!(dilated[6]);
+        assert!(dilated[2 * 5 + 2]);
+        assert!(dilated[3 * 5 + 3]);
+        assert!(!dilated[0]);
+    }
+
+    #[test]
+    fn temporal_disagreement_sees_moving_region_across_covering_frames() {
+        let mut a = ImageBuffer::from_pixel(20, 20, Rgb([100, 100, 100]));
+        let mut b = ImageBuffer::from_pixel(20, 20, Rgb([100, 100, 100]));
+        let c = ImageBuffer::from_pixel(20, 20, Rgb([100, 100, 100]));
+        a.put_pixel(10, 10, Rgb([240, 20, 20]));
+        b.put_pixel(10, 10, Rgb([20, 20, 240]));
+        let images = vec![a, b, c];
+        let positions = vec![
+            Position { x: 0, y: 0 },
+            Position { x: 0, y: 0 },
+            Position { x: 0, y: 0 },
+        ];
+        assert!(covering_temporal_disagreement(&images, &positions, 10, 10, 0) > 100.0);
+        assert_eq!(
+            covering_temporal_disagreement(&images, &positions, 0, 0, 0),
+            0.0
+        );
+    }
+
+    #[test]
     fn eval_passes_clean_single_source_image() {
         let img = synthetic_canvas(220, 160);
         let mut map = SourceMap::new(220, 160);
@@ -2107,6 +2289,8 @@ mod tests {
                 motion_weight: 8.0,
                 motion_radius: 4,
                 motion_threshold: 1.0,
+                motion_mask_dilate: 0,
+                motion_hard_penalty: 0.0,
                 edge_weight: 0.15,
             },
             None,
