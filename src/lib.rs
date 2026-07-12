@@ -852,6 +852,8 @@ pub struct EvalThresholds {
     pub max_duplicate_patches: usize,
     /// Minimum average luminance-gradient energy. Set to 0 to disable.
     pub min_mean_gradient: f32,
+    /// Minimum 95th percentile luminance-gradient energy. Set to 0 to disable.
+    pub min_p95_gradient: f32,
 }
 
 impl Default for EvalThresholds {
@@ -862,6 +864,7 @@ impl Default for EvalThresholds {
             max_duplicate_bands: 0,
             max_duplicate_patches: 0,
             min_mean_gradient: 0.0,
+            min_p95_gradient: 0.0,
         }
     }
 }
@@ -894,6 +897,7 @@ pub struct EvaluationReport {
     pub thresholds: EvalThresholds,
     pub source_map_distinct_sources: usize,
     pub mean_gradient: f32,
+    pub p95_gradient: f32,
     pub failures: Vec<String>,
 }
 
@@ -947,6 +951,7 @@ pub fn evaluate_stitch(
     } else {
         grad.iter().sum::<f32>() / grad.len() as f32
     };
+    let p95_gradient = percentile_gradient(&grad, 95.0);
 
     let mut risk = vec![false; (w * h) as usize];
     let mut boundary_pixels = 0u32;
@@ -1016,6 +1021,7 @@ pub fn evaluate_stitch(
         thresholds,
         source_map_distinct_sources,
         mean_gradient,
+        p95_gradient,
         failures,
     }
 }
@@ -1112,6 +1118,16 @@ fn gradient_map(gray: &[f32], w: u32, h: u32) -> Vec<f32> {
 
 type SourcePair = (u8, u8);
 type SourcePairCount = (SourcePair, u32);
+
+fn percentile_gradient(grad: &[f32], percentile: f32) -> f32 {
+    if grad.is_empty() {
+        return 0.0;
+    }
+    let mut values = grad.to_vec();
+    values.sort_by(|a, b| a.total_cmp(b));
+    let index = ((values.len() - 1) as f32 * (percentile / 100.0)).round() as usize;
+    values[index.min(values.len() - 1)]
+}
 
 fn distinct_assigned_sources(source_map: &SourceMap) -> usize {
     let mut seen = [false; 256];
@@ -1722,7 +1738,7 @@ mod tests {
         }
         let sharp_report = evaluate_stitch(&sharp, &map, EvalThresholds::default());
         let thresholds = EvalThresholds {
-            min_mean_gradient: sharp_report.mean_gradient * 0.50,
+            min_p95_gradient: sharp_report.p95_gradient * 0.75,
             ..Default::default()
         };
         let blurred_report = evaluate_stitch(&blurred, &map, thresholds);
@@ -1731,7 +1747,7 @@ mod tests {
             blurred_report
                 .failures
                 .iter()
-                .any(|failure| failure.contains("mean_gradient"))
+                .any(|failure| failure.contains("p95_gradient"))
         );
     }
 }
