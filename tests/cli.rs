@@ -141,6 +141,7 @@ fn cli_stitches_vertical_pan_with_motion_aware_seams() {
             "5",
             "--align-scale",
             "1",
+            "--monotonic-frame-filter",
             "--output",
             out.to_str().unwrap(),
             "--report",
