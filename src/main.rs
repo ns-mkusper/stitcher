@@ -138,6 +138,18 @@ struct EvalArgs {
     #[arg(long)]
     source_block_overlay: Option<PathBuf>,
 
+    /// Write crops around the largest high-risk seam components for inspection.
+    #[arg(long)]
+    component_crops_dir: Option<PathBuf>,
+
+    /// Padding around each high-risk component crop.
+    #[arg(long, default_value_t = 40)]
+    component_crop_padding: u32,
+
+    /// Maximum number of high-risk component crops to write.
+    #[arg(long, default_value_t = 12)]
+    max_component_crops: usize,
+
     #[arg(long, default_value_t = 250)]
     max_high_risk_boundary_pixels: u32,
 
@@ -350,6 +362,16 @@ fn eval_cli(args: EvalArgs) -> Result<()> {
             .with_context(|| format!("saving {}", path.display()))?;
         println!("wrote {}", path.display());
     }
+    if let Some(dir) = &args.component_crops_dir {
+        write_component_crops(
+            &stitched,
+            &source_map,
+            &report,
+            dir,
+            args.component_crop_padding,
+            args.max_component_crops,
+        )?;
+    }
 
     std::fs::write(&args.output, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing {}", args.output.display()))?;
@@ -361,6 +383,48 @@ fn eval_cli(args: EvalArgs) -> Result<()> {
     } else {
         bail!("EVAL TEST: FAIL: {}", report.failures.join("; "))
     }
+}
+
+fn write_component_crops(
+    stitched: &image::RgbImage,
+    source_map: &SourceMap,
+    report: &stitcher::EvaluationReport,
+    dir: &Path,
+    padding: u32,
+    limit: usize,
+) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let source_overlay = draw_source_block_overlay(stitched, source_map);
+    for (idx, component) in report.high_risk_components.iter().take(limit).enumerate() {
+        let [x, y, w, h] = component.bbox_xywh;
+        let x0 = x.saturating_sub(padding);
+        let y0 = y.saturating_sub(padding);
+        let x1 = (x + w + padding).min(stitched.width());
+        let y1 = (y + h + padding).min(stitched.height());
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let crop_w = x1 - x0;
+        let crop_h = y1 - y0;
+        let stem = format!(
+            "component_{idx:02}_area_{}_bbox_{}_{}_{}_{}",
+            component.area_px, x, y, w, h
+        );
+        let stitched_crop = image::imageops::crop_imm(stitched, x0, y0, crop_w, crop_h).to_image();
+        let source_crop =
+            image::imageops::crop_imm(&source_overlay, x0, y0, crop_w, crop_h).to_image();
+        let stitched_path = dir.join(format!("{stem}_stitched.png"));
+        let source_path = dir.join(format!("{stem}_source_overlay.png"));
+        stitched_crop
+            .save(&stitched_path)
+            .with_context(|| format!("saving {}", stitched_path.display()))?;
+        source_crop
+            .save(&source_path)
+            .with_context(|| format!("saving {}", source_path.display()))?;
+        println!("wrote {}", stitched_path.display());
+        println!("wrote {}", source_path.display());
+    }
+    Ok(())
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
