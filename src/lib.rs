@@ -850,6 +850,10 @@ pub struct EvalThresholds {
     pub max_largest_risky_component_area: u32,
     pub max_duplicate_bands: usize,
     pub max_duplicate_patches: usize,
+    /// Minimum average luminance-gradient energy. Set to 0 to disable.
+    pub min_mean_gradient: f32,
+    /// Minimum 95th percentile luminance-gradient energy. Set to 0 to disable.
+    pub min_p95_gradient: f32,
 }
 
 impl Default for EvalThresholds {
@@ -859,6 +863,8 @@ impl Default for EvalThresholds {
             max_largest_risky_component_area: 300,
             max_duplicate_bands: 0,
             max_duplicate_patches: 0,
+            min_mean_gradient: 0.0,
+            min_p95_gradient: 0.0,
         }
     }
 }
@@ -889,6 +895,9 @@ pub struct EvaluationReport {
     pub handoff_pairs: Vec<HandoffPairReport>,
     pub duplicate_report: DuplicateReport,
     pub thresholds: EvalThresholds,
+    pub source_map_distinct_sources: usize,
+    pub mean_gradient: f32,
+    pub p95_gradient: f32,
     pub failures: Vec<String>,
 }
 
@@ -936,6 +945,13 @@ pub fn evaluate_stitch(
     let grad = gradient_map(&gray, w, h);
     let (boundary, handoff_counts) = source_boundary_map(source_map);
     let local = box_filter(&grad, w, h, 10);
+    let source_map_distinct_sources = distinct_assigned_sources(source_map);
+    let mean_gradient = if grad.is_empty() {
+        0.0
+    } else {
+        grad.iter().sum::<f32>() / grad.len() as f32
+    };
+    let p95_gradient = percentile_gradient(&grad, 95.0);
 
     let mut risk = vec![false; (w * h) as usize];
     let mut boundary_pixels = 0u32;
@@ -992,6 +1008,18 @@ pub fn evaluate_stitch(
             thresholds.max_duplicate_patches
         ));
     }
+    if mean_gradient < thresholds.min_mean_gradient {
+        failures.push(format!(
+            "mean_gradient {:.3} < {:.3}",
+            mean_gradient, thresholds.min_mean_gradient
+        ));
+    }
+    if p95_gradient < thresholds.min_p95_gradient {
+        failures.push(format!(
+            "p95_gradient {:.3} < {:.3}",
+            p95_gradient, thresholds.min_p95_gradient
+        ));
+    }
 
     EvaluationReport {
         passed: failures.is_empty(),
@@ -1003,6 +1031,9 @@ pub fn evaluate_stitch(
         handoff_pairs,
         duplicate_report,
         thresholds,
+        source_map_distinct_sources,
+        mean_gradient,
+        p95_gradient,
         failures,
     }
 }
@@ -1099,6 +1130,26 @@ fn gradient_map(gray: &[f32], w: u32, h: u32) -> Vec<f32> {
 
 type SourcePair = (u8, u8);
 type SourcePairCount = (SourcePair, u32);
+
+fn percentile_gradient(grad: &[f32], percentile: f32) -> f32 {
+    if grad.is_empty() {
+        return 0.0;
+    }
+    let mut values = grad.to_vec();
+    values.sort_by(|a, b| a.total_cmp(b));
+    let index = ((values.len() - 1) as f32 * (percentile / 100.0)).round() as usize;
+    values[index.min(values.len() - 1)]
+}
+
+fn distinct_assigned_sources(source_map: &SourceMap) -> usize {
+    let mut seen = [false; 256];
+    for &value in &source_map.data {
+        if value != SourceMap::UNASSIGNED {
+            seen[value as usize] = true;
+        }
+    }
+    seen.into_iter().filter(|v| *v).count()
+}
 
 fn source_boundary_map(source_map: &SourceMap) -> (Vec<bool>, Vec<SourcePairCount>) {
     let w = source_map.width;
@@ -1297,7 +1348,7 @@ pub fn detect_duplicates(img: &RgbImage) -> DuplicateReport {
 
 fn detect_duplicate_bands(img: &RgbImage) -> Vec<DuplicateBand> {
     let (w, h) = img.dimensions();
-    let band_h = min(180, h / 3).max(80);
+    let band_h = min(h, min(180, h / 3).max(80));
     let stride = 10;
     let small_w = 384;
     let ys: Vec<u32> = (0..=h.saturating_sub(band_h)).step_by(stride).collect();
@@ -1342,8 +1393,8 @@ fn detect_duplicate_bands(img: &RgbImage) -> Vec<DuplicateBand> {
 
 fn detect_duplicate_patches(img: &RgbImage) -> Vec<DuplicatePatch> {
     let (w, h) = img.dimensions();
-    let patch_w = min(360, w / 2).max(120);
-    let patch_h = min(240, h / 3).max(100);
+    let patch_w = min(w, min(360, w / 2).max(120));
+    let patch_h = min(h, min(240, h / 3).max(100));
     let x_stride = 90usize;
     let y_stride = 40usize;
     let xs: Vec<u32> = (0..=w.saturating_sub(patch_w)).step_by(x_stride).collect();
@@ -1436,10 +1487,14 @@ fn feature_for_rect(
     let mut gray = vec![0.0f32; (out_w * out_h) as usize];
     for oy in 0..out_h {
         for ox in 0..out_w {
-            let sx0 = x0 + ox * rw / out_w;
-            let sx1 = x0 + ((ox + 1) * rw / out_w).max(ox * rw / out_w + 1).min(rw);
-            let sy0 = y0 + oy * rh / out_h;
-            let sy1 = y0 + ((oy + 1) * rh / out_h).max(oy * rh / out_h + 1).min(rh);
+            let sx_rel0 = ox * rw / out_w;
+            let sx_rel1 = ((ox + 1) * rw / out_w).max(sx_rel0 + 1).min(rw);
+            let sy_rel0 = oy * rh / out_h;
+            let sy_rel1 = ((oy + 1) * rh / out_h).max(sy_rel0 + 1).min(rh);
+            let sx0 = x0 + sx_rel0;
+            let sx1 = x0 + sx_rel1;
+            let sy0 = y0 + sy_rel0;
+            let sy1 = y0 + sy_rel1;
             let mut sum = 0.0;
             let mut n = 0.0;
             for y in sy0..sy1 {
@@ -1679,5 +1734,36 @@ mod tests {
         assert_eq!(roundtrip.get(1, 0), 1);
         assert_eq!(roundtrip.get(2, 1), 6);
         assert_eq!(roundtrip.get(2, 0), SourceMap::UNASSIGNED);
+    }
+
+    #[test]
+    fn eval_can_reject_blur_to_pass_outputs() {
+        let mut sharp = RgbImage::new(180, 120);
+        for y in 0..120 {
+            for x in 0..180 {
+                let value = if ((x / 8) + (y / 8)) % 2 == 0 { 0 } else { 255 };
+                sharp.put_pixel(x, y, Rgb([value, value, value]));
+            }
+        }
+        let blurred = ImageBuffer::from_pixel(180, 120, Rgb([128, 128, 128]));
+        let mut map = SourceMap::new(180, 120);
+        for y in 0..120 {
+            for x in 0..180 {
+                map.set(x, y, 0);
+            }
+        }
+        let sharp_report = evaluate_stitch(&sharp, &map, EvalThresholds::default());
+        let thresholds = EvalThresholds {
+            min_p95_gradient: sharp_report.p95_gradient * 0.75,
+            ..Default::default()
+        };
+        let blurred_report = evaluate_stitch(&blurred, &map, thresholds);
+        assert!(!blurred_report.passed);
+        assert!(
+            blurred_report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("p95_gradient"))
+        );
     }
 }
