@@ -1,5 +1,6 @@
 use assert_cmd::Command;
-use image::{Rgb, RgbImage};
+use image::{GrayImage, Luma, Rgb, RgbImage};
+use serde_json::json;
 use std::path::Path;
 
 fn synthetic_canvas(w: u32, h: u32) -> RgbImage {
@@ -90,4 +91,114 @@ fn cli_stitches_horizontal_pan_and_writes_report() {
         serde_json::from_slice(&std::fs::read(eval_report).unwrap()).unwrap();
     assert_eq!(eval_json["passed"], true);
     assert!(eval_overlay.exists());
+}
+
+#[test]
+fn cli_eval_rejects_fake_single_source_map_for_multi_frame_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stitched = tmp.path().join("stitched.png");
+    let source_map = tmp.path().join("source_map.png");
+    let report = tmp.path().join("report.json");
+    let eval_report = tmp.path().join("eval.json");
+
+    synthetic_canvas(120, 80).save(&stitched).unwrap();
+    let mut map = GrayImage::new(120, 80);
+    for pixel in map.pixels_mut() {
+        *pixel = Luma([1]);
+    }
+    map.save(&source_map).unwrap();
+    std::fs::write(
+        &report,
+        serde_json::to_vec_pretty(&json!({
+            "shifts": [{"dx": -40, "dy": 0, "score": 1.0}],
+            "raw_positions": [{"x":0,"y":0},{"x":40,"y":0}],
+            "normalized_positions": [{"x":0,"y":0},{"x":40,"y":0}],
+            "canvas_width": 120,
+            "canvas_height": 80,
+            "duplicate_report": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitcher")
+        .unwrap()
+        .args([
+            "eval",
+            "--stitched",
+            stitched.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--source-map",
+            source_map.to_str().unwrap(),
+            "--output",
+            eval_report.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    let eval_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(eval_report).unwrap()).unwrap();
+    assert!(
+        eval_json["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap().contains("source_map_distinct_sources"))
+    );
+}
+
+#[test]
+fn cli_eval_rejects_unapproved_crop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stitched = tmp.path().join("stitched.png");
+    let source_map = tmp.path().join("source_map.png");
+    let report = tmp.path().join("report.json");
+    let eval_report = tmp.path().join("eval.json");
+
+    synthetic_canvas(100, 70).save(&stitched).unwrap();
+    let mut map = GrayImage::new(100, 70);
+    for pixel in map.pixels_mut() {
+        *pixel = Luma([1]);
+    }
+    map.save(&source_map).unwrap();
+    std::fs::write(
+        &report,
+        serde_json::to_vec_pretty(&json!({
+            "shifts": [],
+            "raw_positions": [{"x":0,"y":0}],
+            "normalized_positions": [{"x":0,"y":0}],
+            "canvas_width": 120,
+            "canvas_height": 80,
+            "duplicate_report": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitcher")
+        .unwrap()
+        .args([
+            "eval",
+            "--stitched",
+            stitched.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--source-map",
+            source_map.to_str().unwrap(),
+            "--output",
+            eval_report.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    let eval_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(eval_report).unwrap()).unwrap();
+    assert!(
+        eval_json["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap().contains("cropped_output"))
+    );
 }
