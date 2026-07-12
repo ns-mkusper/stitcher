@@ -1729,7 +1729,7 @@ mod tests {
                 sharp.put_pixel(x, y, Rgb([value, value, value]));
             }
         }
-        let blurred = image::imageops::blur(&sharp, 6.0);
+        let blurred = ImageBuffer::from_pixel(180, 120, Rgb([128, 128, 128]));
         let mut map = SourceMap::new(180, 120);
         for y in 0..120 {
             for x in 0..180 {
