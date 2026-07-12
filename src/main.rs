@@ -83,6 +83,10 @@ struct StitchArgs {
     #[arg(long, default_value_t = 3)]
     snap_x: i32,
 
+    /// Use the longest monotonic frame subsequence for overlap seams; excluded frames only fill unique holes.
+    #[arg(long)]
+    monotonic_frame_filter: bool,
+
     /// Motion-aware seam penalty weight for --source-selection seam-dp-motion.
     #[arg(long, default_value_t = 2.0)]
     seam_motion_weight: f32,
@@ -241,6 +245,7 @@ fn options_from_args(args: &StitchArgs) -> StitchOptions {
         align_scale: args.align_scale,
         snap_x: args.snap_x,
         check_duplicates: args.check_duplicates,
+        monotonic_frame_filter: args.monotonic_frame_filter,
         seam_motion_weight: args.seam_motion_weight,
         seam_motion_radius: args.seam_motion_radius,
         seam_motion_threshold: args.seam_motion_threshold,
