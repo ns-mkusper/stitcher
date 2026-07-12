@@ -211,3 +211,87 @@ Most promising work:
    - Emit crops around top risky bboxes for review.
    - Add coverage/content-loss checks beyond the current crop rejection.
 ```
+
+## Monotonic frame-filter experiment
+
+A stronger source-ownership experiment was added behind:
+
+```bash
+--monotonic-frame-filter
+```
+
+This keeps the longest monotonic frame subsequence for overlap seam decisions and lets excluded reversal/outlier frames fill only pixels that would otherwise be unassigned. For this benchmark it removes the leading position reversal from overlap ownership while preserving full output size and a real source map.
+
+Generated with:
+
+```bash
+stitcher stitch \
+  --mode vertical \
+  --source-selection seam-dp-motion \
+  --monotonic-frame-filter \
+  --min-shift-y 20 \
+  --max-drift-x 80 \
+  --output rent_monotonic_filter.png \
+  --report rent_monotonic_filter_report.json \
+  --source-map rent_monotonic_filter_source.png \
+  <timestamp-ordered frames>
+```
+
+Artifacts:
+
+```text
+/workspace/rent-a-girlfriend/stitches/monotonic_filter/rent_monotonic_filter.png
+/workspace/rent-a-girlfriend/stitches/monotonic_filter/rent_monotonic_filter_source.png
+/workspace/rent-a-girlfriend/stitches/monotonic_filter/rent_monotonic_filter_eval.json
+/workspace/rent-a-girlfriend/stitches/monotonic_filter/rent_monotonic_filter_eval_overlay.png
+/workspace/rent-a-girlfriend/stitches/monotonic_filter/rent_monotonic_filter_source_blocks.png
+/workspace/rent-a-girlfriend/stitches/monotonic_filter/component_crops/
+```
+
+Metrics:
+
+```text
+passed: false
+image_size: 1948x2660
+boundary_pixels: 23595
+high_risk_boundary_pixels: 2521
+largest_risky_component_area: 300
+duplicate_patches: 2
+source_map_distinct_sources: 7
+mean_gradient: 2.0279498
+p95_gradient: 8.0
+failures:
+  - high_risk_boundary_pixels 2521 > 250
+  - duplicate_patches 2 > 0
+```
+
+Comparison to previous motion-aware seam-DP:
+
+```text
+boundary_pixels:           26157 -> 23595  (-2562)
+high_risk_boundary_pixels:  2699 -> 2521   (-178)
+largest_risky_component:     300 -> 300
+duplicate_patches:             2 -> 2
+```
+
+Assessment: this is a real, non-cheating improvement in source ownership and reduces the source-boundary surface area, but it still does not solve the hardest background duplicates or the largest seam components. The excluded frame is not discarded from the source map entirely; it still fills unique/unassigned holes, so the output remains full-size and source-map backed.
+
+Additional stronger prototypes were tried but not committed:
+
+```text
+background-masked alignment:
+  high_risk_boundary_pixels worsened to 4254
+  largest_risky_component_area worsened to 556
+  duplicate_patches stayed 2
+
+source-label island cleanup:
+  slightly reduced boundary_pixels
+  did not reduce duplicate_patches
+  did not improve high_risk_boundary_pixels materially
+
+simple exposure/color-bias matching:
+  reduced high_risk_boundary_pixels only from 2699 to 2687
+  duplicate_patches stayed 2
+```
+
+Next likely step: a true global label optimization or graph-cut style seam/source assignment with explicit foreground/motion masks. The monotonic filter helps by removing an input-order reversal from seam ownership, but remaining failures are now dominated by real background alignment/source-placement problems between adjacent retained frames.
