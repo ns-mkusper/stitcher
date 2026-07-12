@@ -21,6 +21,26 @@ fn synthetic_canvas(w: u32, h: u32) -> RgbImage {
     img
 }
 
+fn random_texture_canvas(w: u32, h: u32) -> RgbImage {
+    let mut img = RgbImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let mut v = x.wrapping_mul(374_761_393) ^ y.wrapping_mul(668_265_263);
+            v = (v ^ (v >> 13)).wrapping_mul(1_274_126_177);
+            img.put_pixel(
+                x,
+                y,
+                Rgb([
+                    (v & 0xff) as u8,
+                    ((v >> 8) & 0xff) as u8,
+                    ((v >> 16) & 0xff) as u8,
+                ]),
+            );
+        }
+    }
+    img
+}
+
 fn save_crop(canvas: &RgbImage, x: u32, y: u32, w: u32, h: u32, path: &Path) {
     image::imageops::crop_imm(canvas, x, y, w, h)
         .to_image()
@@ -91,6 +111,55 @@ fn cli_stitches_horizontal_pan_and_writes_report() {
         serde_json::from_slice(&std::fs::read(eval_report).unwrap()).unwrap();
     assert_eq!(eval_json["passed"], true);
     assert!(eval_overlay.exists());
+}
+
+#[test]
+fn cli_stitches_vertical_pan_with_motion_aware_seams() {
+    let tmp = tempfile::tempdir().unwrap();
+    let canvas = random_texture_canvas(180, 360);
+    let a = tmp.path().join("a.png");
+    let b = tmp.path().join("b.png");
+    let c = tmp.path().join("c.png");
+    let out = tmp.path().join("out.png");
+    let report = tmp.path().join("report.json");
+    let source_map = tmp.path().join("source_map.png");
+    save_crop(&canvas, 0, 0, 180, 160, &a);
+    save_crop(&canvas, 0, 80, 180, 160, &b);
+    save_crop(&canvas, 0, 160, 180, 160, &c);
+
+    Command::cargo_bin("stitcher")
+        .unwrap()
+        .args([
+            "stitch",
+            "--mode",
+            "vertical",
+            "--source-selection",
+            "seam-dp-motion",
+            "--min-shift-y",
+            "40",
+            "--max-drift-x",
+            "5",
+            "--align-scale",
+            "1",
+            "--output",
+            out.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--source-map",
+            source_map.to_str().unwrap(),
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            c.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(out.exists());
+    assert!(report.exists());
+    assert!(source_map.exists());
+    let report_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert!(report_json["canvas_height"].as_u64().unwrap() >= 300);
 }
 
 #[test]

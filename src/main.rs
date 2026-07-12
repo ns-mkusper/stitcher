@@ -83,6 +83,22 @@ struct StitchArgs {
     #[arg(long, default_value_t = 3)]
     snap_x: i32,
 
+    /// Motion-aware seam penalty weight for --source-selection seam-dp-motion.
+    #[arg(long, default_value_t = 2.0)]
+    seam_motion_weight: f32,
+
+    /// Radius for local temporal-difference seam penalty.
+    #[arg(long, default_value_t = 6)]
+    seam_motion_radius: u32,
+
+    /// Ignore local temporal differences below this threshold.
+    #[arg(long, default_value_t = 12.0)]
+    seam_motion_threshold: f32,
+
+    /// Weight for avoiding strong luminance edges in seam search.
+    #[arg(long, default_value_t = 0.15)]
+    seam_edge_weight: f32,
+
     /// Save a JSON report with shifts, canvas positions, and duplicate findings.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -173,6 +189,7 @@ impl From<CliPanMode> for PanMode {
 enum CliSourceSelection {
     NearestCenter,
     SeamDp,
+    SeamDpMotion,
 }
 
 impl From<CliSourceSelection> for SourceSelection {
@@ -180,6 +197,7 @@ impl From<CliSourceSelection> for SourceSelection {
         match value {
             CliSourceSelection::NearestCenter => SourceSelection::NearestCenter,
             CliSourceSelection::SeamDp => SourceSelection::SeamDp,
+            CliSourceSelection::SeamDpMotion => SourceSelection::SeamDpMotion,
         }
     }
 }
@@ -211,6 +229,10 @@ fn options_from_args(args: &StitchArgs) -> StitchOptions {
         align_scale: args.align_scale,
         snap_x: args.snap_x,
         check_duplicates: args.check_duplicates,
+        seam_motion_weight: args.seam_motion_weight,
+        seam_motion_radius: args.seam_motion_radius,
+        seam_motion_threshold: args.seam_motion_threshold,
+        seam_edge_weight: args.seam_edge_weight,
     }
 }
 

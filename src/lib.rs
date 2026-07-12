@@ -64,6 +64,7 @@ pub struct StitchReport {
 pub enum SourceSelection {
     NearestCenter,
     SeamDp,
+    SeamDpMotion,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +80,10 @@ pub struct StitchOptions {
     pub align_scale: usize,
     pub snap_x: i32,
     pub check_duplicates: bool,
+    pub seam_motion_weight: f32,
+    pub seam_motion_radius: u32,
+    pub seam_motion_threshold: f32,
+    pub seam_edge_weight: f32,
 }
 
 impl Default for StitchOptions {
@@ -95,6 +100,10 @@ impl Default for StitchOptions {
             align_scale: 4,
             snap_x: 3,
             check_duplicates: false,
+            seam_motion_weight: 2.0,
+            seam_motion_radius: 6,
+            seam_motion_threshold: 12.0,
+            seam_edge_weight: 0.15,
         }
     }
 }
@@ -164,6 +173,18 @@ pub fn stitch_images_with_source_map(
         SourceSelection::SeamDp => {
             synthesize_vertical_seams_with_source_map(images, &positions, canvas_w, canvas_h)?
         }
+        SourceSelection::SeamDpMotion => synthesize_vertical_seams_with_source_map_opts(
+            images,
+            &positions,
+            canvas_w,
+            canvas_h,
+            SeamOptions::motion_aware(
+                opts.seam_motion_weight,
+                opts.seam_motion_radius,
+                opts.seam_motion_threshold,
+                opts.seam_edge_weight,
+            ),
+        )?,
     };
     let duplicate_report = opts.check_duplicates.then(|| detect_duplicates(&stitched));
     if let Some(report) = &duplicate_report
@@ -533,11 +554,73 @@ pub fn synthesize_nearest_center_with_source_map(
     Ok((out, source_map))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SeamOptions {
+    motion_weight: f32,
+    motion_radius: u32,
+    motion_threshold: f32,
+    edge_weight: f32,
+}
+
+impl SeamOptions {
+    const BASIC: Self = Self {
+        motion_weight: 0.0,
+        motion_radius: 0,
+        motion_threshold: 0.0,
+        edge_weight: 0.15,
+    };
+
+    fn motion_aware(
+        motion_weight: f32,
+        motion_radius: u32,
+        motion_threshold: f32,
+        edge_weight: f32,
+    ) -> Self {
+        Self {
+            motion_weight,
+            motion_radius,
+            motion_threshold,
+            edge_weight,
+        }
+    }
+}
+
 pub fn synthesize_vertical_seams_with_source_map(
     images: &[RgbImage],
     positions: &[Position],
     canvas_w: u32,
     canvas_h: u32,
+) -> Result<(RgbImage, SourceMap)> {
+    synthesize_vertical_seams_with_source_map_opts(
+        images,
+        positions,
+        canvas_w,
+        canvas_h,
+        SeamOptions::BASIC,
+    )
+}
+
+pub fn synthesize_vertical_seams_motion_with_source_map(
+    images: &[RgbImage],
+    positions: &[Position],
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Result<(RgbImage, SourceMap)> {
+    synthesize_vertical_seams_with_source_map_opts(
+        images,
+        positions,
+        canvas_w,
+        canvas_h,
+        SeamOptions::motion_aware(2.0, 6, 12.0, 0.15),
+    )
+}
+
+fn synthesize_vertical_seams_with_source_map_opts(
+    images: &[RgbImage],
+    positions: &[Position],
+    canvas_w: u32,
+    canvas_h: u32,
+    seam_options: SeamOptions,
 ) -> Result<(RgbImage, SourceMap)> {
     if images.is_empty() {
         bail!("need at least one image");
@@ -570,7 +653,18 @@ pub fn synthesize_vertical_seams_with_source_map(
         let pos = positions[idx];
         let overlap = overlap_rect_with_existing(&source_map, pos, w, h);
         if let Some((x0, y0, x1, y1)) = overlap {
-            let seam = find_vertical_pan_seam(&canvas, &images[idx], pos, x0, y0, x1, y1);
+            let seam = find_vertical_pan_seam(
+                &canvas,
+                &source_map,
+                images,
+                positions,
+                idx,
+                x0,
+                y0,
+                x1,
+                y1,
+                seam_options,
+            );
             paste_with_seam(
                 &mut canvas,
                 &mut source_map,
@@ -642,15 +736,21 @@ fn overlap_rect_with_existing(
     found.then_some((min_x, min_y, max_x + 1, max_y + 1))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_vertical_pan_seam(
     canvas: &RgbImage,
-    incoming: &RgbImage,
-    pos: Position,
+    source_map: &SourceMap,
+    images: &[RgbImage],
+    positions: &[Position],
+    incoming_idx: usize,
     x0: u32,
     y0: u32,
     x1: u32,
     y1: u32,
+    seam_options: SeamOptions,
 ) -> Vec<u32> {
+    let incoming = &images[incoming_idx];
+    let pos = positions[incoming_idx];
     let ow = (x1 - x0) as usize;
     let oh = (y1 - y0) as usize;
     if ow == 0 || oh == 0 {
@@ -674,7 +774,25 @@ fn find_vertical_pan_seam(
             } else {
                 0.0
             };
-            cost[yy * ow + xx] = color + 0.15 * edge + edge_margin_penalty;
+            let motion = if seam_options.motion_weight > 0.0 {
+                let existing_source = source_map.get(cx, cy);
+                let diff = aligned_temporal_diff(
+                    images,
+                    positions,
+                    existing_source,
+                    incoming_idx,
+                    cx,
+                    cy,
+                    seam_options.motion_radius,
+                );
+                (diff - seam_options.motion_threshold).max(0.0)
+            } else {
+                0.0
+            };
+            cost[yy * ow + xx] = color
+                + seam_options.edge_weight * edge
+                + edge_margin_penalty
+                + seam_options.motion_weight * motion;
         }
     }
 
@@ -758,6 +876,63 @@ fn paste_with_seam(
                 source_map.set(cxu, cyu, source);
             }
         }
+    }
+}
+
+fn aligned_temporal_diff(
+    images: &[RgbImage],
+    positions: &[Position],
+    existing_source: u8,
+    incoming_idx: usize,
+    cx: u32,
+    cy: u32,
+    radius: u32,
+) -> f32 {
+    if existing_source == SourceMap::UNASSIGNED {
+        return 0.0;
+    }
+    let existing_idx = existing_source as usize;
+    if existing_idx >= images.len() || incoming_idx >= images.len() {
+        return 0.0;
+    }
+
+    let existing_pos = positions[existing_idx];
+    let incoming_pos = positions[incoming_idx];
+    let radius = radius as i32;
+    let mut total = 0.0;
+    let mut count = 0u32;
+
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let sample_x = cx as i32 + dx;
+            let sample_y = cy as i32 + dy;
+            let ex = sample_x - existing_pos.x;
+            let ey = sample_y - existing_pos.y;
+            let ix = sample_x - incoming_pos.x;
+            let iy = sample_y - incoming_pos.y;
+            if ex < 0
+                || ey < 0
+                || ix < 0
+                || iy < 0
+                || ex >= images[existing_idx].width() as i32
+                || ey >= images[existing_idx].height() as i32
+                || ix >= images[incoming_idx].width() as i32
+                || iy >= images[incoming_idx].height() as i32
+            {
+                continue;
+            }
+            total += rgb_abs_diff(
+                images[existing_idx].get_pixel(ex as u32, ey as u32).0,
+                images[incoming_idx].get_pixel(ix as u32, iy as u32).0,
+            );
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f32
     }
 }
 
@@ -1734,6 +1909,79 @@ mod tests {
         assert_eq!(roundtrip.get(1, 0), 1);
         assert_eq!(roundtrip.get(2, 1), 6);
         assert_eq!(roundtrip.get(2, 0), SourceMap::UNASSIGNED);
+    }
+
+    #[test]
+    fn seam_motion_source_map_matches_selected_pixels() {
+        let canvas = synthetic_canvas(80, 140);
+        let mut a = image::imageops::crop_imm(&canvas, 0, 0, 80, 80).to_image();
+        let mut b = image::imageops::crop_imm(&canvas, 0, 40, 80, 80).to_image();
+        for y in 18..34 {
+            for x in 25..55 {
+                a.put_pixel(x, y + 40, Rgb([240, 20, 20]));
+                b.put_pixel(x, y, Rgb([20, 20, 240]));
+            }
+        }
+        let images = vec![a, b];
+        let positions = vec![Position { x: 0, y: 0 }, Position { x: 0, y: 40 }];
+        let (stitched, source_map) =
+            synthesize_vertical_seams_motion_with_source_map(&images, &positions, 80, 120).unwrap();
+
+        for y in 0..stitched.height() {
+            for x in 0..stitched.width() {
+                let source = source_map.get(x, y);
+                if source == SourceMap::UNASSIGNED {
+                    continue;
+                }
+                let source_idx = source as usize;
+                let sx = x as i32 - positions[source_idx].x;
+                let sy = y as i32 - positions[source_idx].y;
+                assert!(sx >= 0 && sy >= 0);
+                assert_eq!(
+                    *stitched.get_pixel(x, y),
+                    *images[source_idx].get_pixel(sx as u32, sy as u32)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seam_motion_avoids_moving_overlap_region() {
+        let base = ImageBuffer::from_pixel(90, 130, Rgb([120, 120, 120]));
+        let mut a = image::imageops::crop_imm(&base, 0, 0, 90, 80).to_image();
+        let mut b = image::imageops::crop_imm(&base, 0, 40, 90, 80).to_image();
+        for y in 52..68 {
+            for x in 30..60 {
+                a.put_pixel(x, y, Rgb([255, 0, 0]));
+                b.put_pixel(x, y - 40, Rgb([0, 0, 255]));
+            }
+        }
+        let images = vec![a, b];
+        let positions = vec![Position { x: 0, y: 0 }, Position { x: 0, y: 40 }];
+        let (_stitched, source_map) = synthesize_vertical_seams_with_source_map_opts(
+            &images,
+            &positions,
+            90,
+            120,
+            SeamOptions {
+                motion_weight: 8.0,
+                motion_radius: 4,
+                motion_threshold: 1.0,
+                edge_weight: 0.15,
+            },
+        )
+        .unwrap();
+
+        for x in 30..60 {
+            let boundary_y =
+                (41..80).find(|&y| source_map.get(x, y - 1) == 0 && source_map.get(x, y) == 1);
+            if let Some(y) = boundary_y {
+                assert!(
+                    !(52..68).contains(&y),
+                    "source seam crossed moving rectangle at x={x}, y={y}"
+                );
+            }
+        }
     }
 
     #[test]
