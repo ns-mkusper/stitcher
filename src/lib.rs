@@ -1008,6 +1008,18 @@ pub fn evaluate_stitch(
             thresholds.max_duplicate_patches
         ));
     }
+    if mean_gradient < thresholds.min_mean_gradient {
+        failures.push(format!(
+            "mean_gradient {:.3} < {:.3}",
+            mean_gradient, thresholds.min_mean_gradient
+        ));
+    }
+    if p95_gradient < thresholds.min_p95_gradient {
+        failures.push(format!(
+            "p95_gradient {:.3} < {:.3}",
+            p95_gradient, thresholds.min_p95_gradient
+        ));
+    }
 
     EvaluationReport {
         passed: failures.is_empty(),
