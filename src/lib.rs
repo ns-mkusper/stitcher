@@ -1706,8 +1706,14 @@ mod tests {
 
     #[test]
     fn eval_can_reject_blur_to_pass_outputs() {
-        let sharp = synthetic_canvas(180, 120);
-        let blurred = image::imageops::blur(&sharp, 5.0);
+        let mut sharp = RgbImage::new(180, 120);
+        for y in 0..120 {
+            for x in 0..180 {
+                let value = if ((x / 8) + (y / 8)) % 2 == 0 { 0 } else { 255 };
+                sharp.put_pixel(x, y, Rgb([value, value, value]));
+            }
+        }
+        let blurred = image::imageops::blur(&sharp, 6.0);
         let mut map = SourceMap::new(180, 120);
         for y in 0..120 {
             for x in 0..180 {
@@ -1716,7 +1722,7 @@ mod tests {
         }
         let sharp_report = evaluate_stitch(&sharp, &map, EvalThresholds::default());
         let thresholds = EvalThresholds {
-            min_mean_gradient: sharp_report.mean_gradient * 0.75,
+            min_mean_gradient: sharp_report.mean_gradient * 0.50,
             ..Default::default()
         };
         let blurred_report = evaluate_stitch(&blurred, &map, thresholds);
