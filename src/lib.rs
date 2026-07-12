@@ -1348,7 +1348,7 @@ pub fn detect_duplicates(img: &RgbImage) -> DuplicateReport {
 
 fn detect_duplicate_bands(img: &RgbImage) -> Vec<DuplicateBand> {
     let (w, h) = img.dimensions();
-    let band_h = min(180, h / 3).max(80);
+    let band_h = min(h, min(180, h / 3).max(80));
     let stride = 10;
     let small_w = 384;
     let ys: Vec<u32> = (0..=h.saturating_sub(band_h)).step_by(stride).collect();
