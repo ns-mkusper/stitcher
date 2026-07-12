@@ -271,3 +271,65 @@ fn cli_eval_rejects_unapproved_crop() {
             .any(|f| f.as_str().unwrap().contains("cropped_output"))
     );
 }
+
+#[test]
+fn cli_eval_writes_high_risk_component_crops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stitched = tmp.path().join("stitched.png");
+    let source_map = tmp.path().join("source_map.png");
+    let report = tmp.path().join("report.json");
+    let eval_report = tmp.path().join("eval.json");
+    let crops_dir = tmp.path().join("component_crops");
+
+    let mut img = RgbImage::new(120, 80);
+    let mut map = GrayImage::new(120, 80);
+    for y in 0..80 {
+        for x in 0..120 {
+            if x < 60 {
+                img.put_pixel(x, y, Rgb([0, 0, 0]));
+                map.put_pixel(x, y, Luma([1]));
+            } else {
+                img.put_pixel(x, y, Rgb([255, 255, 255]));
+                map.put_pixel(x, y, Luma([2]));
+            }
+        }
+    }
+    img.save(&stitched).unwrap();
+    map.save(&source_map).unwrap();
+    std::fs::write(
+        &report,
+        serde_json::to_vec_pretty(&json!({
+            "shifts": [{"dx": 0, "dy": -40, "score": 1.0}],
+            "raw_positions": [{"x":0,"y":0},{"x":0,"y":40}],
+            "normalized_positions": [{"x":0,"y":0},{"x":0,"y":40}],
+            "canvas_width": 120,
+            "canvas_height": 80,
+            "duplicate_report": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitcher")
+        .unwrap()
+        .args([
+            "eval",
+            "--stitched",
+            stitched.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--source-map",
+            source_map.to_str().unwrap(),
+            "--output",
+            eval_report.to_str().unwrap(),
+            "--max-high-risk-boundary-pixels",
+            "0",
+            "--component-crops-dir",
+            crops_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    let crops: Vec<_> = std::fs::read_dir(&crops_dir).unwrap().collect();
+    assert!(crops.len() >= 2, "expected stitched/source overlay crops");
+}
