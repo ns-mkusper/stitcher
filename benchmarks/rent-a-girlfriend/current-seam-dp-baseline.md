@@ -295,3 +295,70 @@ simple exposure/color-bias matching:
 ```
 
 Next likely step: a true global label optimization or graph-cut style seam/source assignment with explicit foreground/motion masks. The monotonic filter helps by removing an input-order reversal from seam ownership, but remaining failures are now dominated by real background alignment/source-placement problems between adjacent retained frames.
+
+## Best current parameterized output: monotonic frame filter + horizontal drift suppression
+
+A follow-up sweep showed that much of the remaining left/right background seam risk came from small horizontal drift estimates in an otherwise vertical pan. Letting alignment search within a reasonable drift window but snapping all small x-shifts back to zero produced the best honest output so far:
+
+```bash
+stitcher stitch \
+  --mode vertical \
+  --source-selection seam-dp-motion \
+  --monotonic-frame-filter \
+  --min-shift-y 20 \
+  --max-drift-x 40 \
+  --snap-x 40 \
+  --output mono.png \
+  --report mono_report.json \
+  --source-map mono_source.png \
+  <timestamp-ordered frames>
+```
+
+Artifacts:
+
+```text
+/workspace/rent-a-girlfriend/stitches/snap_x_best/mono.png
+/workspace/rent-a-girlfriend/stitches/snap_x_best/mono_source.png
+/workspace/rent-a-girlfriend/stitches/snap_x_best/mono_eval.json
+/workspace/rent-a-girlfriend/stitches/snap_x_best/mono_overlay.png
+/workspace/rent-a-girlfriend/stitches/snap_x_best/mono_blocks.png
+/workspace/rent-a-girlfriend/stitches/snap_x_best/mono_crops/
+```
+
+Metrics:
+
+```text
+passed: false
+image_size: 1920x2660
+boundary_pixels: 17735
+high_risk_boundary_pixels: 2075
+largest_risky_component_area: 125
+duplicate_patches: 2
+failures:
+  - high_risk_boundary_pixels 2075 > 250
+  - duplicate_patches 2 > 0
+```
+
+Comparison:
+
+```text
+motion-aware seam-DP:
+  boundary_pixels: 26157
+  high_risk_boundary_pixels: 2699
+  largest_risky_component_area: 300
+  duplicate_patches: 2
+
+monotonic frame filter:
+  boundary_pixels: 23595
+  high_risk_boundary_pixels: 2521
+  largest_risky_component_area: 300
+  duplicate_patches: 2
+
+monotonic + snap-x 40:
+  boundary_pixels: 17735
+  high_risk_boundary_pixels: 2075
+  largest_risky_component_area: 125
+  duplicate_patches: 2
+```
+
+Assessment: this is the best current output by the hardened metrics and directly targets visible uneven background seams caused by horizontal jitter. It does not crop the vertical pan; the width returns to the native frame width because the previous extra width came from small estimated x drift in a vertical pan. The duplicate patch failures remain; inspection shows the reported duplicate patches are entirely inside source frame 6 / the top source region, so they may be source-inherent repeated background rather than a duplicate introduced by stitching. Do not suppress that gate with source-map tricks; future evaluator work should distinguish source-inherent duplicates using the original inputs, not the stitched source map.
