@@ -53,26 +53,28 @@ failures:
 
 This is a major improvement over rectangular/nearest-center source handoffs. The foreground female is close to coherent, but the background still has bad seams/duplicated patches. Next work should focus on background consistency and motion-aware seam penalties rather than broad blending.
 
-## Post-processing experiment: background smoothing/repair
+## Invalidated post-processing experiment: background smoothing/repair
 
-After seam-DP, a background-only repair/smoothing pass was tested outside the core Rust stitcher. It preserves the foreground subject, smooths/inpaints the background around source handoffs, and crops obvious duplicated top/side background.
+A background smoothing/repair pass was tested after seam-DP, but it is **not** considered a valid improvement path.
 
-Best strict source-map eval with original seam source map:
-
-```text
-high_risk_boundary_pixels: 810
-largest_risky_component_area: 85
-duplicate_patches: 0
-```
-
-Because the repair pass creates a new composite image, evaluating it with a single-layer composite source map gives:
+Why it is invalid:
 
 ```text
-passed: true
-boundary_pixels: 0
-high_risk_boundary_pixels: 0
-largest_risky_component_area: 0
-duplicate_patches: 0
+- It used blur to hide artifacts instead of fixing registration/source selection.
+- It cropped away real content, including part of the subject in the taller pan.
+- It could be made to pass seam metrics with a fake single-layer source map.
+- It still left duplicate background content in the image.
 ```
 
-This means the visible duplicate/background block issue is substantially improved, but the core stitcher should eventually model repaired/composited regions explicitly rather than using a single-layer source map as a shortcut.
+The only honest use for background blur is a small final touch-up after the stitch is already high confidence. It must not be used to reach the next quality level or to make evaluator metrics pass.
+
+Future evaluator work must add explicit regression gates for:
+
+```text
+- no content-loss/cropping unless explicitly requested
+- no sharpness/edge-energy collapse from blur
+- no fake source-map shortcuts for multi-frame outputs
+- duplicate-patch detection independent of source map
+```
+
+The current honest benchmark remains the seam-DP output above, which still fails and should be improved by better background registration, motion-aware seam costs, and foreground-aware source selection.
