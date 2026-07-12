@@ -132,6 +132,10 @@ struct EvalArgs {
     #[arg(long, default_value_t = 0.0)]
     min_mean_gradient: f32,
 
+    /// Minimum 95th percentile edge/sharpness score. Set to 0 to disable.
+    #[arg(long, default_value_t = 0.0)]
+    min_p95_gradient: f32,
+
     /// Allow the stitched image to be smaller than the reported full canvas.
     #[arg(long)]
     allow_crop: bool,
@@ -291,6 +295,7 @@ fn eval_cli(args: EvalArgs) -> Result<()> {
         max_high_risk_boundary_pixels: args.max_high_risk_boundary_pixels,
         max_largest_risky_component_area: args.max_largest_risky_component_area,
         min_mean_gradient: args.min_mean_gradient,
+        min_p95_gradient: args.min_p95_gradient,
         ..Default::default()
     };
     let mut report = evaluate_stitch(&stitched, &source_map, thresholds);
