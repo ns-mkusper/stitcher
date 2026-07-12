@@ -127,6 +127,14 @@ struct EvalArgs {
 
     #[arg(long, default_value_t = 300)]
     max_largest_risky_component_area: u32,
+
+    /// Minimum average edge/sharpness score. Set to 0 to disable.
+    #[arg(long, default_value_t = 0.0)]
+    min_mean_gradient: f32,
+
+    /// Allow the stitched image to be smaller than the reported full canvas.
+    #[arg(long)]
+    allow_crop: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -282,9 +290,26 @@ fn eval_cli(args: EvalArgs) -> Result<()> {
     let thresholds = EvalThresholds {
         max_high_risk_boundary_pixels: args.max_high_risk_boundary_pixels,
         max_largest_risky_component_area: args.max_largest_risky_component_area,
+        min_mean_gradient: args.min_mean_gradient,
         ..Default::default()
     };
-    let report = evaluate_stitch(&stitched, &source_map, thresholds);
+    let mut report = evaluate_stitch(&stitched, &source_map, thresholds);
+    let (stitched_w, stitched_h) = stitched.dimensions();
+    if !args.allow_crop
+        && (stitched_w < stitch_report.canvas_width || stitched_h < stitch_report.canvas_height)
+    {
+        report.failures.push(format!(
+            "cropped_output {}x{} < reported_canvas {}x{}",
+            stitched_w, stitched_h, stitch_report.canvas_width, stitch_report.canvas_height
+        ));
+    }
+    if stitch_report.normalized_positions.len() > 1 && report.source_map_distinct_sources < 2 {
+        report.failures.push(format!(
+            "source_map_distinct_sources {} < 2 for multi-frame stitch",
+            report.source_map_distinct_sources
+        ));
+    }
+    report.passed = report.failures.is_empty();
 
     if let Some(path) = &args.overlay {
         draw_evaluation_overlay(&stitched, &source_map, &report)
