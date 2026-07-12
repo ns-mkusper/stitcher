@@ -1393,8 +1393,8 @@ fn detect_duplicate_bands(img: &RgbImage) -> Vec<DuplicateBand> {
 
 fn detect_duplicate_patches(img: &RgbImage) -> Vec<DuplicatePatch> {
     let (w, h) = img.dimensions();
-    let patch_w = min(360, w / 2).max(120);
-    let patch_h = min(240, h / 3).max(100);
+    let patch_w = min(w, min(360, w / 2).max(120));
+    let patch_h = min(h, min(240, h / 3).max(100));
     let x_stride = 90usize;
     let y_stride = 40usize;
     let xs: Vec<u32> = (0..=w.saturating_sub(patch_w)).step_by(x_stride).collect();
@@ -1487,10 +1487,14 @@ fn feature_for_rect(
     let mut gray = vec![0.0f32; (out_w * out_h) as usize];
     for oy in 0..out_h {
         for ox in 0..out_w {
-            let sx0 = x0 + ox * rw / out_w;
-            let sx1 = x0 + ((ox + 1) * rw / out_w).max(ox * rw / out_w + 1).min(rw);
-            let sy0 = y0 + oy * rh / out_h;
-            let sy1 = y0 + ((oy + 1) * rh / out_h).max(oy * rh / out_h + 1).min(rh);
+            let sx_rel0 = ox * rw / out_w;
+            let sx_rel1 = ((ox + 1) * rw / out_w).max(sx_rel0 + 1).min(rw);
+            let sy_rel0 = oy * rh / out_h;
+            let sy_rel1 = ((oy + 1) * rh / out_h).max(sy_rel0 + 1).min(rh);
+            let sx0 = x0 + sx_rel0;
+            let sx1 = x0 + sx_rel1;
+            let sy0 = y0 + sy_rel0;
+            let sy1 = y0 + sy_rel1;
             let mut sum = 0.0;
             let mut n = 0.0;
             for y in sy0..sy1 {
