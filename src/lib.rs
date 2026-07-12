@@ -80,6 +80,7 @@ pub struct StitchOptions {
     pub align_scale: usize,
     pub snap_x: i32,
     pub check_duplicates: bool,
+    pub monotonic_frame_filter: bool,
     pub seam_motion_weight: f32,
     pub seam_motion_radius: u32,
     pub seam_motion_threshold: f32,
@@ -100,6 +101,7 @@ impl Default for StitchOptions {
             align_scale: 4,
             snap_x: 3,
             check_duplicates: false,
+            monotonic_frame_filter: false,
             seam_motion_weight: 2.0,
             seam_motion_radius: 6,
             seam_motion_threshold: 12.0,
@@ -166,13 +168,22 @@ pub fn stitch_images_with_source_map(
 
     let raw_positions = positions_from_shifts(&shifts);
     let (positions, canvas_w, canvas_h) = normalize_positions(&raw_positions, w, h);
+    let active_sources = opts
+        .monotonic_frame_filter
+        .then(|| monotonic_active_sources(&raw_positions));
+    let active_sources = active_sources.as_deref();
     let (stitched, source_map) = match opts.source_selection {
         SourceSelection::NearestCenter => {
             synthesize_nearest_center_with_source_map(images, &positions, canvas_w, canvas_h)?
         }
-        SourceSelection::SeamDp => {
-            synthesize_vertical_seams_with_source_map(images, &positions, canvas_w, canvas_h)?
-        }
+        SourceSelection::SeamDp => synthesize_vertical_seams_with_source_map_opts(
+            images,
+            &positions,
+            canvas_w,
+            canvas_h,
+            SeamOptions::BASIC,
+            active_sources,
+        )?,
         SourceSelection::SeamDpMotion => synthesize_vertical_seams_with_source_map_opts(
             images,
             &positions,
@@ -184,6 +195,7 @@ pub fn stitch_images_with_source_map(
                 opts.seam_motion_threshold,
                 opts.seam_edge_weight,
             ),
+            active_sources,
         )?,
     };
     let duplicate_report = opts.check_duplicates.then(|| detect_duplicates(&stitched));
@@ -475,6 +487,68 @@ fn ncc_content_shift(a: &GrayF32, b: &GrayF32, dx: i32, dy: i32) -> f32 {
     num / (den_a.sqrt() * den_b.sqrt()).max(1e-6)
 }
 
+fn monotonic_active_sources(raw_positions: &[Position]) -> Vec<bool> {
+    if raw_positions.len() <= 2 {
+        return vec![true; raw_positions.len()];
+    }
+    let span_x = raw_positions.iter().map(|p| p.x).max().unwrap_or(0)
+        - raw_positions.iter().map(|p| p.x).min().unwrap_or(0);
+    let span_y = raw_positions.iter().map(|p| p.y).max().unwrap_or(0)
+        - raw_positions.iter().map(|p| p.y).min().unwrap_or(0);
+    let values: Vec<i32> = if span_y >= span_x {
+        raw_positions.iter().map(|p| p.y).collect()
+    } else {
+        raw_positions.iter().map(|p| p.x).collect()
+    };
+    let inc = longest_monotonic_indices(&values, true, 8);
+    let dec = longest_monotonic_indices(&values, false, 8);
+    let prefer_increasing = values.last().unwrap_or(&0) >= values.first().unwrap_or(&0);
+    let chosen = if dec.len() > inc.len() || (dec.len() == inc.len() && !prefer_increasing) {
+        dec
+    } else {
+        inc
+    };
+    if chosen.len() < 2 || chosen.len() == raw_positions.len() {
+        return vec![true; raw_positions.len()];
+    }
+    let mut active = vec![false; raw_positions.len()];
+    for idx in chosen {
+        active[idx] = true;
+    }
+    active
+}
+
+fn longest_monotonic_indices(values: &[i32], increasing: bool, tolerance: i32) -> Vec<usize> {
+    let n = values.len();
+    let mut dp = vec![1usize; n];
+    let mut prev = vec![None; n];
+    for i in 0..n {
+        for j in 0..i {
+            let monotonic = if increasing {
+                values[i] + tolerance >= values[j]
+            } else {
+                values[i] <= values[j] + tolerance
+            };
+            if monotonic && dp[j] + 1 > dp[i] {
+                dp[i] = dp[j] + 1;
+                prev[i] = Some(j);
+            }
+        }
+    }
+    let mut best = (0..n).max_by_key(|&i| dp[i]).unwrap_or(0);
+    let mut out = Vec::new();
+    loop {
+        out.push(best);
+        if let Some(p) = prev[best] {
+            best = p;
+        } else {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}
+
 pub fn positions_from_shifts(shifts: &[Shift]) -> Vec<Position> {
     let mut pos = vec![Position { x: 0, y: 0 }];
     let mut x = 0;
@@ -597,6 +671,7 @@ pub fn synthesize_vertical_seams_with_source_map(
         canvas_w,
         canvas_h,
         SeamOptions::BASIC,
+        None,
     )
 }
 
@@ -612,6 +687,7 @@ pub fn synthesize_vertical_seams_motion_with_source_map(
         canvas_w,
         canvas_h,
         SeamOptions::motion_aware(2.0, 6, 12.0, 0.15),
+        None,
     )
 }
 
@@ -621,6 +697,7 @@ fn synthesize_vertical_seams_with_source_map_opts(
     canvas_w: u32,
     canvas_h: u32,
     seam_options: SeamOptions,
+    active_sources: Option<&[bool]>,
 ) -> Result<(RgbImage, SourceMap)> {
     if images.is_empty() {
         bail!("need at least one image");
@@ -636,7 +713,12 @@ fn synthesize_vertical_seams_with_source_map_opts(
         return synthesize_nearest_center_with_source_map(images, positions, canvas_w, canvas_h);
     }
 
-    let mut order: Vec<usize> = (0..images.len()).collect();
+    let mut order: Vec<usize> = (0..images.len())
+        .filter(|&i| active_sources.is_none_or(|active| active[i]))
+        .collect();
+    if order.is_empty() {
+        order = (0..images.len()).collect();
+    }
     order.sort_by_key(|&i| positions[i].y);
     let first = order[0];
     let mut canvas = ImageBuffer::from_pixel(canvas_w, canvas_h, Rgb([0, 0, 0]));
@@ -682,6 +764,14 @@ fn synthesize_vertical_seams_with_source_map_opts(
         }
     }
 
+    if let Some(active) = active_sources {
+        for (idx, img) in images.iter().enumerate() {
+            if !active[idx] {
+                paste_unassigned(&mut canvas, &mut source_map, img, positions[idx], idx as u8);
+            }
+        }
+    }
+
     Ok((canvas, source_map))
 }
 
@@ -697,6 +787,30 @@ fn paste_full(
             let cx = pos.x + sx as i32;
             let cy = pos.y + sy as i32;
             if cx >= 0 && cy >= 0 && cx < canvas.width() as i32 && cy < canvas.height() as i32 {
+                canvas.put_pixel(cx as u32, cy as u32, *img.get_pixel(sx, sy));
+                source_map.set(cx as u32, cy as u32, source);
+            }
+        }
+    }
+}
+
+fn paste_unassigned(
+    canvas: &mut RgbImage,
+    source_map: &mut SourceMap,
+    img: &RgbImage,
+    pos: Position,
+    source: u8,
+) {
+    for sy in 0..img.height() {
+        for sx in 0..img.width() {
+            let cx = pos.x + sx as i32;
+            let cy = pos.y + sy as i32;
+            if cx >= 0
+                && cy >= 0
+                && cx < canvas.width() as i32
+                && cy < canvas.height() as i32
+                && source_map.get(cx as u32, cy as u32) == SourceMap::UNASSIGNED
+            {
                 canvas.put_pixel(cx as u32, cy as u32, *img.get_pixel(sx, sy));
                 source_map.set(cx as u32, cy as u32, source);
             }
@@ -1854,6 +1968,32 @@ mod tests {
     }
 
     #[test]
+    fn monotonic_frame_filter_drops_leading_reversal() {
+        let raw = vec![
+            Position { x: 0, y: 0 },
+            Position { x: -24, y: 276 },
+            Position { x: -24, y: 20 },
+            Position { x: -4, y: -148 },
+            Position { x: -28, y: -348 },
+            Position { x: -28, y: -656 },
+            Position { x: 0, y: -1304 },
+        ];
+        let active = monotonic_active_sources(&raw);
+        assert_eq!(active, vec![false, true, true, true, true, true, true]);
+    }
+
+    #[test]
+    fn monotonic_frame_filter_keeps_already_monotonic_sequence() {
+        let raw = vec![
+            Position { x: 0, y: 0 },
+            Position { x: 0, y: -150 },
+            Position { x: 0, y: -300 },
+        ];
+        let active = monotonic_active_sources(&raw);
+        assert_eq!(active, vec![true, true, true]);
+    }
+
+    #[test]
     fn eval_passes_clean_single_source_image() {
         let img = synthetic_canvas(220, 160);
         let mut map = SourceMap::new(220, 160);
@@ -1969,6 +2109,7 @@ mod tests {
                 motion_threshold: 1.0,
                 edge_weight: 0.15,
             },
+            None,
         )
         .unwrap();
 
