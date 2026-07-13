@@ -12,9 +12,9 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use stitcher::{
-    EvalThresholds, PanMode, SourceMap, SourceSelection, StitchOptions, StitchReport,
-    detect_duplicates, draw_duplicate_overlay, draw_evaluation_overlay, draw_source_block_overlay,
-    evaluate_stitch, generate_source_map, load_images, stitch_images,
+    EvalThresholds, ForegroundMask, PanMode, SourceMap, SourceSelection, StitchOptions,
+    StitchReport, detect_duplicates, draw_duplicate_overlay, draw_evaluation_overlay,
+    draw_source_block_overlay, evaluate_stitch, generate_source_map, load_images, stitch_images,
     stitch_images_with_source_map,
 };
 use tokio::fs;
@@ -86,6 +86,22 @@ struct StitchArgs {
     /// Use the longest monotonic frame subsequence for overlap seams; excluded frames only fill unique holes.
     #[arg(long)]
     monotonic_frame_filter: bool,
+
+    /// Directory of per-frame foreground mask PNGs used as hard seam-avoidance regions.
+    #[arg(long)]
+    foreground_mask_dir: Option<PathBuf>,
+
+    /// Foreground mask pixels above this value are treated as protected foreground.
+    #[arg(long, default_value_t = 127)]
+    foreground_mask_threshold: u8,
+
+    /// Dilate external foreground masks by this many pixels in seam-search coordinates.
+    #[arg(long, default_value_t = 0)]
+    foreground_mask_dilate: u32,
+
+    /// Hard seam penalty inside external foreground masks. Set to 0 to disable.
+    #[arg(long, default_value_t = 0.0)]
+    foreground_mask_penalty: f32,
 
     /// Motion-aware seam penalty weight for --source-selection seam-dp-motion.
     #[arg(long, default_value_t = 2.0)]
@@ -254,6 +270,9 @@ fn options_from_args(args: &StitchArgs) -> StitchOptions {
         snap_x: args.snap_x,
         check_duplicates: args.check_duplicates,
         monotonic_frame_filter: args.monotonic_frame_filter,
+        foreground_masks: None,
+        foreground_mask_dilate: args.foreground_mask_dilate,
+        foreground_mask_penalty: args.foreground_mask_penalty,
         seam_motion_weight: args.seam_motion_weight,
         seam_motion_radius: args.seam_motion_radius,
         seam_motion_threshold: args.seam_motion_threshold,
@@ -263,9 +282,81 @@ fn options_from_args(args: &StitchArgs) -> StitchOptions {
     }
 }
 
+fn load_foreground_masks(
+    inputs: &[PathBuf],
+    dir: &Path,
+    threshold: u8,
+) -> Result<Vec<ForegroundMask>> {
+    let sorted_pngs = sorted_mask_files(dir)?;
+    let use_sorted_fallback = sorted_pngs.len() == inputs.len();
+    let mut masks = Vec::with_capacity(inputs.len());
+    for (idx, input) in inputs.iter().enumerate() {
+        let path = find_foreground_mask_path(input, dir, idx).or_else(|| {
+            use_sorted_fallback
+                .then(|| sorted_pngs.get(idx).cloned())
+                .flatten()
+        });
+        let path = path.with_context(|| {
+            format!(
+                "no foreground mask found for input {} in {}; tried index/stem PNG names",
+                input.display(),
+                dir.display()
+            )
+        })?;
+        let gray = image::open(&path)
+            .with_context(|| format!("loading foreground mask {}", path.display()))?
+            .into_luma8();
+        masks.push(ForegroundMask::from_gray_image(&gray, threshold));
+    }
+    Ok(masks)
+}
+
+fn sorted_mask_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn find_foreground_mask_path(input: &Path, dir: &Path, index: usize) -> Option<PathBuf> {
+    let stem = input.file_stem().and_then(|s| s.to_str());
+    let mut names = vec![
+        format!("{index}.png"),
+        format!("{index:02}.png"),
+        format!("{index:03}.png"),
+        format!("mask_{index}.png"),
+        format!("mask_{index:02}.png"),
+    ];
+    if let Some(stem) = stem {
+        names.push(format!("{stem}.png"));
+        names.push(format!("{stem}_mask.png"));
+        names.push(format!("mask_{stem}.png"));
+    }
+    names
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.exists())
+}
+
 fn stitch_cli(args: StitchArgs) -> Result<()> {
     let images = load_images(&args.inputs).context("loading input images")?;
-    let opts = options_from_args(&args);
+    let mut opts = options_from_args(&args);
+    if let Some(dir) = &args.foreground_mask_dir {
+        opts.foreground_masks = Some(load_foreground_masks(
+            &args.inputs,
+            dir,
+            args.foreground_mask_threshold,
+        )?);
+    }
     let (stitched, source_map, mut report) =
         stitch_images_with_source_map(&images, &opts).context("stitching images")?;
     stitched
