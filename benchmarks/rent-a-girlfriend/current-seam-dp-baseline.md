@@ -445,3 +445,102 @@ lower hand/pocket seam px: 0
 Assessment: the general foreground mask does what it was intended to do: it can reduce or eliminate the diagonal hand/pocket source boundary without blur/crop/fake maps. The best balanced setting (`t30_d4_p100`) slightly improves the hardened metric and cuts the hand/pocket seam roughly in half. A more aggressive setting (`t80_d16_p100`) eliminates the lower pocket seam entirely, but it moves cost elsewhere and grows the largest risky component, so it is not clearly better overall.
 
 The remaining duplicate-patch failures are unchanged. They still appear to be in repeated top/background source content rather than the foreground hand seam. The next algorithmic step should be global label optimization or a true graph-cut style source assignment that can jointly optimize foreground protection, seam length, source order, and background duplicate avoidance.
+
+## External foreground-mask experiment
+
+A follow-up PR added a generic external foreground-mask input path so segmentation masks from a human editor, SAM/SAM2, optical-flow tooling, or any other AI/vision model can guide seam placement without letting the model synthesize pixels.
+
+New CLI knobs:
+
+```bash
+--foreground-mask-dir <dir>
+--foreground-mask-threshold <0-255>
+--foreground-mask-dilate <px>
+--foreground-mask-penalty <cost>
+```
+
+Mask loading rules:
+
+```text
+- one PNG mask per input frame
+- accepted names include 0.png, 00.png, mask_0.png, <input_stem>.png, <input_stem>_mask.png
+- if no explicit name matches and the directory contains exactly one PNG per input, sorted PNGs are used
+- mask pixels above --foreground-mask-threshold are protected foreground
+```
+
+The Rust stitcher only uses masks as seam penalties. The output pixels still come directly from selected input frames, and the source map remains real.
+
+Because this workspace did not have SAM2/torch installed, the sweep used external temporal-disagreement masks generated outside the Rust crate. These masks are a stand-in for AI masks and exercise the same CLI path that SAM2/manual masks would use.
+
+Best external-mask run from the sweep:
+
+```bash
+stitcher stitch \
+  --mode vertical \
+  --source-selection seam-dp-motion \
+  --monotonic-frame-filter \
+  --min-shift-y 20 \
+  --max-drift-x 40 \
+  --snap-x 40 \
+  --foreground-mask-dir /workspace/rent-a-girlfriend/foreground_masks/temporal_t60 \
+  --foreground-mask-dilate 0 \
+  --foreground-mask-penalty 50 \
+  --output ext_t60_d0_p50.png \
+  --report ext_t60_d0_p50_report.json \
+  --source-map ext_t60_d0_p50_source.png \
+  <timestamp-ordered frames>
+```
+
+Artifacts:
+
+```text
+/workspace/rent-a-girlfriend/stitches/external_mask_sweep/ext_t60_d0_p50.png
+/workspace/rent-a-girlfriend/stitches/external_mask_sweep/ext_t60_d0_p50_source.png
+/workspace/rent-a-girlfriend/stitches/external_mask_sweep/ext_t60_d0_p50_eval_with_overlays.json
+/workspace/rent-a-girlfriend/stitches/external_mask_sweep/ext_t60_d0_p50_overlay.png
+/workspace/rent-a-girlfriend/stitches/external_mask_sweep/ext_t60_d0_p50_source_blocks.png
+/workspace/rent-a-girlfriend/stitches/external_mask_sweep/ext_t60_d0_p50_crops/
+```
+
+Metrics:
+
+```text
+passed: false
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+lower hand/pocket seam px: 0
+upper waist seam px: 2689
+full body-middle seam px: 6997
+failures:
+  - high_risk_boundary_pixels 1918 > 250
+  - duplicate_patches 2 > 0
+```
+
+Comparison to prior candidates:
+
+```text
+monotonic + snap-x 40:
+  boundary_pixels: 17735
+  high_risk_boundary_pixels: 2075
+  largest_risky_component_area: 125
+  duplicate_patches: 2
+  lower hand/pocket seam px: 199
+
+internal foreground hard-mask balanced:
+  boundary_pixels: 17915
+  high_risk_boundary_pixels: 2009
+  largest_risky_component_area: 133
+  duplicate_patches: 2
+  lower hand/pocket seam px: 107
+
+external temporal foreground mask:
+  boundary_pixels: 18034
+  high_risk_boundary_pixels: 1918
+  largest_risky_component_area: 135
+  duplicate_patches: 2
+  lower hand/pocket seam px: 0
+```
+
+Assessment: external masks produced the best high-risk metric so far and eliminated the lower hand/pocket source seam without blur, crop, or fake maps. The duplicate-patch gate remains unchanged. A true SAM2/segmentation mask may do better than the temporal-disagreement masks used here because it can protect the full subject instead of only high-disagreement pixels, but this should be tested through the same mask input path.

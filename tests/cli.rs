@@ -123,9 +123,16 @@ fn cli_stitches_vertical_pan_with_motion_aware_seams() {
     let out = tmp.path().join("out.png");
     let report = tmp.path().join("report.json");
     let source_map = tmp.path().join("source_map.png");
+    let mask_dir = tmp.path().join("masks");
+    std::fs::create_dir(&mask_dir).unwrap();
     save_crop(&canvas, 0, 0, 180, 160, &a);
     save_crop(&canvas, 0, 80, 180, 160, &b);
     save_crop(&canvas, 0, 160, 180, 160, &c);
+    for idx in 0..3 {
+        GrayImage::new(180, 160)
+            .save(mask_dir.join(format!("{idx}.png")))
+            .unwrap();
+    }
 
     Command::cargo_bin("stitcher")
         .unwrap()
@@ -142,6 +149,10 @@ fn cli_stitches_vertical_pan_with_motion_aware_seams() {
             "--align-scale",
             "1",
             "--monotonic-frame-filter",
+            "--foreground-mask-dir",
+            mask_dir.to_str().unwrap(),
+            "--foreground-mask-penalty",
+            "100",
             "--output",
             out.to_str().unwrap(),
             "--report",
