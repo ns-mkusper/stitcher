@@ -81,6 +81,9 @@ pub struct StitchOptions {
     pub snap_x: i32,
     pub check_duplicates: bool,
     pub monotonic_frame_filter: bool,
+    pub foreground_masks: Option<Vec<ForegroundMask>>,
+    pub foreground_mask_dilate: u32,
+    pub foreground_mask_penalty: f32,
     pub seam_motion_weight: f32,
     pub seam_motion_radius: u32,
     pub seam_motion_threshold: f32,
@@ -104,6 +107,9 @@ impl Default for StitchOptions {
             snap_x: 3,
             check_duplicates: false,
             monotonic_frame_filter: false,
+            foreground_masks: None,
+            foreground_mask_dilate: 0,
+            foreground_mask_penalty: 0.0,
             seam_motion_weight: 2.0,
             seam_motion_radius: 6,
             seam_motion_threshold: 12.0,
@@ -155,6 +161,28 @@ pub fn stitch_images_with_source_map(
         }
     }
 
+    if let Some(masks) = &opts.foreground_masks {
+        if masks.len() != images.len() {
+            bail!(
+                "foreground mask count {} does not match input image count {}",
+                masks.len(),
+                images.len()
+            );
+        }
+        for (idx, mask) in masks.iter().enumerate() {
+            if (mask.width, mask.height) != (w, h) {
+                bail!(
+                    "foreground mask {} is {}x{}, expected {}x{}",
+                    idx,
+                    mask.width,
+                    mask.height,
+                    w,
+                    h
+                );
+            }
+        }
+    }
+
     let max_shift_y = opts.max_shift_y.unwrap_or((h as f32 * 0.75).round() as i32);
     let max_shift_x = opts.max_shift_x.unwrap_or((w as f32 * 0.75).round() as i32);
     let shifts = estimate_shifts(
@@ -176,6 +204,9 @@ pub fn stitch_images_with_source_map(
         .monotonic_frame_filter
         .then(|| monotonic_active_sources(&raw_positions));
     let active_sources = active_sources.as_deref();
+    let foreground_masks = opts.foreground_masks.as_deref();
+    let foreground_dilate = opts.foreground_mask_dilate;
+    let foreground_penalty = opts.foreground_mask_penalty;
     let (stitched, source_map) = match opts.source_selection {
         SourceSelection::NearestCenter => {
             synthesize_nearest_center_with_source_map(images, &positions, canvas_w, canvas_h)?
@@ -185,8 +216,9 @@ pub fn stitch_images_with_source_map(
             &positions,
             canvas_w,
             canvas_h,
-            SeamOptions::BASIC,
+            SeamOptions::BASIC.with_foreground_mask(foreground_dilate, foreground_penalty),
             active_sources,
+            foreground_masks,
         )?,
         SourceSelection::SeamDpMotion => synthesize_vertical_seams_with_source_map_opts(
             images,
@@ -200,8 +232,10 @@ pub fn stitch_images_with_source_map(
                 opts.seam_motion_mask_dilate,
                 opts.seam_motion_hard_penalty,
                 opts.seam_edge_weight,
-            ),
+            )
+            .with_foreground_mask(foreground_dilate, foreground_penalty),
             active_sources,
+            foreground_masks,
         )?,
     };
     let duplicate_report = opts.check_duplicates.then(|| detect_duplicates(&stitched));
@@ -641,6 +675,8 @@ struct SeamOptions {
     motion_threshold: f32,
     motion_mask_dilate: u32,
     motion_hard_penalty: f32,
+    foreground_mask_dilate: u32,
+    foreground_mask_penalty: f32,
     edge_weight: f32,
 }
 
@@ -651,6 +687,8 @@ impl SeamOptions {
         motion_threshold: 0.0,
         motion_mask_dilate: 0,
         motion_hard_penalty: 0.0,
+        foreground_mask_dilate: 0,
+        foreground_mask_penalty: 0.0,
         edge_weight: 0.15,
     };
 
@@ -668,8 +706,16 @@ impl SeamOptions {
             motion_threshold,
             motion_mask_dilate,
             motion_hard_penalty,
+            foreground_mask_dilate: 0,
+            foreground_mask_penalty: 0.0,
             edge_weight,
         }
+    }
+
+    fn with_foreground_mask(mut self, dilate: u32, penalty: f32) -> Self {
+        self.foreground_mask_dilate = dilate;
+        self.foreground_mask_penalty = penalty;
+        self
     }
 }
 
@@ -685,6 +731,7 @@ pub fn synthesize_vertical_seams_with_source_map(
         canvas_w,
         canvas_h,
         SeamOptions::BASIC,
+        None,
         None,
     )
 }
@@ -702,6 +749,7 @@ pub fn synthesize_vertical_seams_motion_with_source_map(
         canvas_h,
         SeamOptions::motion_aware(2.0, 6, 12.0, 0, 0.0, 0.15),
         None,
+        None,
     )
 }
 
@@ -712,6 +760,7 @@ fn synthesize_vertical_seams_with_source_map_opts(
     canvas_h: u32,
     seam_options: SeamOptions,
     active_sources: Option<&[bool]>,
+    foreground_masks: Option<&[ForegroundMask]>,
 ) -> Result<(RgbImage, SourceMap)> {
     if images.is_empty() {
         bail!("need at least one image");
@@ -760,6 +809,7 @@ fn synthesize_vertical_seams_with_source_map_opts(
                 x1,
                 y1,
                 seam_options,
+                foreground_masks,
             );
             paste_with_seam(
                 &mut canvas,
@@ -876,6 +926,7 @@ fn find_vertical_pan_seam(
     x1: u32,
     y1: u32,
     seam_options: SeamOptions,
+    foreground_masks: Option<&[ForegroundMask]>,
 ) -> Vec<u32> {
     let incoming = &images[incoming_idx];
     let pos = positions[incoming_idx];
@@ -897,6 +948,21 @@ fn find_vertical_pan_seam(
             seam_options.motion_radius,
             seam_options.motion_threshold,
             seam_options.motion_mask_dilate,
+        )
+    } else {
+        vec![false; ow * oh]
+    };
+    let foreground_mask = if seam_options.foreground_mask_penalty > 0.0 {
+        foreground_mask_for_overlap(
+            source_map,
+            foreground_masks,
+            positions,
+            incoming_idx,
+            x0,
+            y0,
+            ow,
+            oh,
+            seam_options.foreground_mask_dilate,
         )
     } else {
         vec![false; ow * oh]
@@ -939,11 +1005,17 @@ fn find_vertical_pan_seam(
             } else {
                 0.0
             };
+            let foreground_penalty = if foreground_mask[yy * ow + xx] {
+                seam_options.foreground_mask_penalty
+            } else {
+                0.0
+            };
             cost[yy * ow + xx] = color
                 + seam_options.edge_weight * edge
                 + edge_margin_penalty
                 + seam_options.motion_weight * motion
-                + hard_motion;
+                + hard_motion
+                + foreground_penalty;
         }
     }
 
@@ -1028,6 +1100,57 @@ fn paste_with_seam(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn foreground_mask_for_overlap(
+    source_map: &SourceMap,
+    masks: Option<&[ForegroundMask]>,
+    positions: &[Position],
+    incoming_idx: usize,
+    x0: u32,
+    y0: u32,
+    ow: usize,
+    oh: usize,
+    dilate: u32,
+) -> Vec<bool> {
+    let Some(masks) = masks else {
+        return vec![false; ow * oh];
+    };
+    if incoming_idx >= masks.len() {
+        return vec![false; ow * oh];
+    }
+    let mut mask = vec![false; ow * oh];
+    for yy in 0..oh {
+        for xx in 0..ow {
+            let cx = x0 + xx as u32;
+            let cy = y0 + yy as u32;
+            let incoming_hit =
+                mask_covers_canvas_pixel(&masks[incoming_idx], positions[incoming_idx], cx, cy);
+            let existing_source = source_map.get(cx, cy);
+            let existing_hit = existing_source != SourceMap::UNASSIGNED
+                && (existing_source as usize) < masks.len()
+                && mask_covers_canvas_pixel(
+                    &masks[existing_source as usize],
+                    positions[existing_source as usize],
+                    cx,
+                    cy,
+                );
+            if incoming_hit || existing_hit {
+                mask[yy * ow + xx] = true;
+            }
+        }
+    }
+    dilate_bool_mask(&mask, ow, oh, dilate as usize)
+}
+
+fn mask_covers_canvas_pixel(mask: &ForegroundMask, pos: Position, cx: u32, cy: u32) -> bool {
+    let sx = cx as i32 - pos.x;
+    let sy = cy as i32 - pos.y;
+    if sx < 0 || sy < 0 || sx >= mask.width as i32 || sy >= mask.height as i32 {
+        return false;
+    }
+    mask.get(sx as u32, sy as u32)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1230,6 +1353,52 @@ fn local_luma_edge(img: &RgbImage, x: u32, y: u32) -> f32 {
 
 fn local_luma_edge_in(img: &RgbImage, x: u32, y: u32) -> f32 {
     local_luma_edge(img, x, y)
+}
+
+#[derive(Debug, Clone)]
+pub struct ForegroundMask {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<bool>,
+}
+
+impl ForegroundMask {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            data: vec![false; (width * height) as usize],
+        }
+    }
+
+    pub fn get(&self, x: u32, y: u32) -> bool {
+        self.data[(y * self.width + x) as usize]
+    }
+
+    pub fn set(&mut self, x: u32, y: u32, value: bool) {
+        self.data[(y * self.width + x) as usize] = value;
+    }
+
+    pub fn from_gray_image(img: &GrayImage, threshold: u8) -> Self {
+        let (width, height) = img.dimensions();
+        let mut mask = Self::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                mask.set(x, y, img.get_pixel(x, y).0[0] > threshold);
+            }
+        }
+        mask
+    }
+
+    pub fn to_gray_image(&self) -> GrayImage {
+        let mut img = GrayImage::new(self.width, self.height);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                img.put_pixel(x, y, Luma([if self.get(x, y) { 255 } else { 0 }]));
+            }
+        }
+        img
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2291,8 +2460,11 @@ mod tests {
                 motion_threshold: 1.0,
                 motion_mask_dilate: 0,
                 motion_hard_penalty: 0.0,
+                foreground_mask_dilate: 0,
+                foreground_mask_penalty: 0.0,
                 edge_weight: 0.15,
             },
+            None,
             None,
         )
         .unwrap();
