@@ -1356,6 +1356,143 @@ fn local_luma_edge_in(img: &RgbImage, x: u32, y: u32) -> f32 {
 }
 
 #[derive(Debug, Clone)]
+pub struct SourceCoordinateMap {
+    pub width: u32,
+    pub height: u32,
+    pub sources: Vec<u8>,
+    pub source_x: Vec<u16>,
+    pub source_y: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceCoordinateVerification {
+    pub checked_pixels: u32,
+    pub mismatched_pixels: u32,
+    pub out_of_bounds_pixels: u32,
+    pub unassigned_pixels: u32,
+}
+
+impl SourceCoordinateMap {
+    pub const UNASSIGNED: u8 = u8::MAX;
+
+    pub fn new(width: u32, height: u32) -> Self {
+        let len = (width * height) as usize;
+        Self {
+            width,
+            height,
+            sources: vec![Self::UNASSIGNED; len],
+            source_x: vec![0; len],
+            source_y: vec![0; len],
+        }
+    }
+
+    pub fn get(&self, x: u32, y: u32) -> Option<(u8, u16, u16)> {
+        let idx = (y * self.width + x) as usize;
+        let source = self.sources[idx];
+        (source != Self::UNASSIGNED).then_some((source, self.source_x[idx], self.source_y[idx]))
+    }
+
+    pub fn set(&mut self, x: u32, y: u32, source: u8, sx: u16, sy: u16) {
+        let idx = (y * self.width + x) as usize;
+        self.sources[idx] = source;
+        self.source_x[idx] = sx;
+        self.source_y[idx] = sy;
+    }
+
+    pub fn from_source_map(source_map: &SourceMap, positions: &[Position]) -> Self {
+        let mut map = Self::new(source_map.width, source_map.height);
+        for y in 0..source_map.height {
+            for x in 0..source_map.width {
+                let source = source_map.get(x, y);
+                if source == SourceMap::UNASSIGNED {
+                    continue;
+                }
+                let source_idx = source as usize;
+                if source_idx >= positions.len() {
+                    continue;
+                }
+                let sx = x as i32 - positions[source_idx].x;
+                let sy = y as i32 - positions[source_idx].y;
+                if sx >= 0 && sy >= 0 && sx <= u16::MAX as i32 && sy <= u16::MAX as i32 {
+                    map.set(x, y, source, sx as u16, sy as u16);
+                }
+            }
+        }
+        map
+    }
+
+    pub fn to_rgb16_image(&self) -> ImageBuffer<Rgb<u16>, Vec<u16>> {
+        let mut img = ImageBuffer::from_pixel(self.width, self.height, Rgb([0u16, 0u16, 0u16]));
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let idx = (y * self.width + x) as usize;
+                let source = self.sources[idx];
+                if source != Self::UNASSIGNED {
+                    img.put_pixel(
+                        x,
+                        y,
+                        Rgb([source as u16 + 1, self.source_x[idx], self.source_y[idx]]),
+                    );
+                }
+            }
+        }
+        img
+    }
+
+    pub fn from_rgb16_image(img: &ImageBuffer<Rgb<u16>, Vec<u16>>) -> Self {
+        let (width, height) = img.dimensions();
+        let mut map = Self::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let p = img.get_pixel(x, y).0;
+                if p[0] != 0 {
+                    map.set(x, y, (p[0] - 1) as u8, p[1], p[2]);
+                }
+            }
+        }
+        map
+    }
+}
+
+pub fn verify_source_coordinate_map(
+    stitched: &RgbImage,
+    inputs: &[RgbImage],
+    coord_map: &SourceCoordinateMap,
+) -> SourceCoordinateVerification {
+    assert_eq!(
+        (stitched.width(), stitched.height()),
+        (coord_map.width, coord_map.height)
+    );
+    let mut report = SourceCoordinateVerification {
+        checked_pixels: 0,
+        mismatched_pixels: 0,
+        out_of_bounds_pixels: 0,
+        unassigned_pixels: 0,
+    };
+    for y in 0..coord_map.height {
+        for x in 0..coord_map.width {
+            let Some((source, sx, sy)) = coord_map.get(x, y) else {
+                report.unassigned_pixels += 1;
+                continue;
+            };
+            let source_idx = source as usize;
+            if source_idx >= inputs.len()
+                || sx as u32 >= inputs[source_idx].width()
+                || sy as u32 >= inputs[source_idx].height()
+            {
+                report.out_of_bounds_pixels += 1;
+                continue;
+            }
+            report.checked_pixels += 1;
+            if stitched.get_pixel(x, y) != inputs[source_idx].get_pixel(sx as u32, sy as u32) {
+                report.mismatched_pixels += 1;
+            }
+        }
+    }
+    report
+}
+
+#[derive(Debug, Clone)]
 pub struct ForegroundMask {
     pub width: u32,
     pub height: u32,
@@ -1503,6 +1640,9 @@ pub struct EvaluationReport {
     pub duplicate_report: DuplicateReport,
     pub thresholds: EvalThresholds,
     pub source_map_distinct_sources: usize,
+    pub source_coord_checked_pixels: u32,
+    pub source_coord_mismatched_pixels: u32,
+    pub source_coord_out_of_bounds_pixels: u32,
     pub mean_gradient: f32,
     pub p95_gradient: f32,
     pub failures: Vec<String>,
@@ -1639,6 +1779,9 @@ pub fn evaluate_stitch(
         duplicate_report,
         thresholds,
         source_map_distinct_sources,
+        source_coord_checked_pixels: 0,
+        source_coord_mismatched_pixels: 0,
+        source_coord_out_of_bounds_pixels: 0,
         mean_gradient,
         p95_gradient,
         failures,
@@ -2386,6 +2529,24 @@ mod tests {
         assert!(!report.passed);
         assert!(report.high_risk_boundary_pixels > 0);
         assert!(report.largest_risky_component_area > 0);
+    }
+
+    #[test]
+    fn source_coordinate_map_round_trips_and_verifies_pixels() {
+        let canvas = synthetic_canvas(120, 80);
+        let a = image::imageops::crop_imm(&canvas, 0, 0, 80, 80).to_image();
+        let b = image::imageops::crop_imm(&canvas, 40, 0, 80, 80).to_image();
+        let images = vec![a, b];
+        let positions = vec![Position { x: 0, y: 0 }, Position { x: 40, y: 0 }];
+        let (stitched, source_map) =
+            synthesize_nearest_center_with_source_map(&images, &positions, 120, 80).unwrap();
+        let coord_map = SourceCoordinateMap::from_source_map(&source_map, &positions);
+        let image = coord_map.to_rgb16_image();
+        let roundtrip = SourceCoordinateMap::from_rgb16_image(&image);
+        let verification = verify_source_coordinate_map(&stitched, &images, &roundtrip);
+        assert!(verification.checked_pixels > 0);
+        assert_eq!(verification.mismatched_pixels, 0);
+        assert_eq!(verification.out_of_bounds_pixels, 0);
     }
 
     #[test]
