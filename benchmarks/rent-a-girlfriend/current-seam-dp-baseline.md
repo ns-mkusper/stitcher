@@ -805,3 +805,100 @@ duplicate_patches: 2
 ```
 
 Assessment: the coordinate-aware warp path is now honest and verifiable, but the tested local y-strip warp does not improve the image. It slightly worsens high-risk pixels while keeping source-coordinate verification clean. This suggests that simple per-strip vertical warping is not the missing lever. Future warps should be driven by a stronger correspondence model, e.g. optical flow or a mesh warp, and should continue using coordinate-map verification.
+
+## Restored screenshot query against Plex source video
+
+After the original `Photos-2-001.zip` and extracted screenshot frames were restored, the screenshots were used as visual queries against the Plex episode sources.
+
+Plex access:
+
+```text
+plexserver reachable via chicago/plex SSH helper
+Rent-a-Girlfriend episode files available under /mnt/data1/anime_shows/Rent-a-Girlfriend and /mnt/data1/torrents
+```
+
+The original screenshot frames were restored at:
+
+```text
+/workspace/rent-a-girlfriend/Photos-2-001.zip
+/workspace/rent-a-girlfriend/photos_2_001/*.jpg
+```
+
+Searches run:
+
+```text
+1. S05E12 1080p torrent, 4fps low-res probe
+2. Season 5 library files, 1fps low-res probe
+3. Late Season 4 library files, 1fps low-res probe
+4. Full-resolution extraction around the best screenshot-match candidates
+```
+
+The query did not produce a confident single exact interval. Best low-res matches scattered across multiple episodes/times, suggesting the screenshots may not correspond to the S05E12 source-video pan candidate, or low-resolution whole-frame matching is too ambiguous for this content.
+
+Full-resolution windows extracted and tested from likely S5 matches:
+
+```text
+s5e11_t1190
+s5e09_t758
+s5e09_t1100
+s5e03_t339
+s5e05_t469
+```
+
+Results:
+
+```text
+s5e11_t1190:
+image_size: 848x550
+boundary_pixels: 16586
+high_risk_boundary_pixels: 616
+largest_risky_component_area: 0
+duplicate_patches: 0
+source_coord_mismatched_pixels: 0
+
+s5e09_t758:
+image_size: 848x694
+boundary_pixels: 45601
+high_risk_boundary_pixels: 389
+largest_risky_component_area: 0
+duplicate_patches: 0
+source_coord_mismatched_pixels: 0
+
+s5e09_t1100:
+image_size: 848x578
+boundary_pixels: 14892
+high_risk_boundary_pixels: 1159
+largest_risky_component_area: 167
+duplicate_patches: 0
+source_coord_mismatched_pixels: 0
+
+s5e03_t339:
+image_size: 848x1106
+boundary_pixels: 8913
+high_risk_boundary_pixels: 2320
+largest_risky_component_area: 294
+duplicate_patches: 0
+source_coord_mismatched_pixels: 0
+
+s5e05_t469:
+image_size: 848x814
+boundary_pixels: 17368
+high_risk_boundary_pixels: 1748
+largest_risky_component_area: 745
+duplicate_patches: 0
+source_coord_mismatched_pixels: 0
+```
+
+Assessment: these extracted windows are not replacements for the restored screenshot stitch. Some have very low duplicate counts, but they are lower-resolution library files and/or much shorter canvas outputs, so they do not reproduce the target full-resolution 1920x2660 pan. The restored screenshot-based output remains the best target result:
+
+```text
+/workspace/rent-a-girlfriend/stitches/current_best_regen/ext_t60_d0_p50.png
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+source_coord_mismatched_pixels: 0
+source_coord_out_of_bounds_pixels: 0
+```
+
+Next possible source-video route: use a more discriminative visual search than whole-frame MAE/NCC, e.g. local patch matching on distinctive foreground/background regions or OCR/time-aware Plex playback metadata if available.
