@@ -103,6 +103,22 @@ struct StitchArgs {
     #[arg(long, default_value_t = 0.0)]
     foreground_mask_penalty: f32,
 
+    /// Render selected source pixels with small per-source/per-strip vertical warp offsets.
+    #[arg(long)]
+    local_warp: bool,
+
+    /// Width of x-strips for --local-warp.
+    #[arg(long, default_value_t = 128)]
+    local_warp_strip_width: u32,
+
+    /// Maximum vertical correction per strip for --local-warp.
+    #[arg(long, default_value_t = 4)]
+    local_warp_max_dy: i32,
+
+    /// Disable local warp offsets inside foreground masks.
+    #[arg(long, default_value_t = true)]
+    local_warp_protect_foreground: bool,
+
     /// Motion-aware seam penalty weight for --source-selection seam-dp-motion.
     #[arg(long, default_value_t = 2.0)]
     seam_motion_weight: f32,
@@ -281,6 +297,10 @@ fn options_from_args(args: &StitchArgs) -> StitchOptions {
         foreground_masks: None,
         foreground_mask_dilate: args.foreground_mask_dilate,
         foreground_mask_penalty: args.foreground_mask_penalty,
+        local_warp: args.local_warp,
+        local_warp_strip_width: args.local_warp_strip_width,
+        local_warp_max_dy: args.local_warp_max_dy,
+        local_warp_protect_foreground: args.local_warp_protect_foreground,
         seam_motion_weight: args.seam_motion_weight,
         seam_motion_radius: args.seam_motion_radius,
         seam_motion_threshold: args.seam_motion_threshold,
@@ -380,10 +400,15 @@ fn stitch_cli(args: StitchArgs) -> Result<()> {
         println!("wrote {}", path.display());
     }
     if let Some(path) = &args.source_coord_map {
-        SourceCoordinateMap::from_source_map(&source_map, &report.normalized_positions)
-            .to_rgb16_image()
-            .save(path)
-            .with_context(|| format!("saving {}", path.display()))?;
+        SourceCoordinateMap::from_source_map_with_local_warp(
+            &source_map,
+            &report.normalized_positions,
+            report.local_warp.as_ref(),
+            opts.foreground_masks.as_deref(),
+        )
+        .to_rgb16_image()
+        .save(path)
+        .with_context(|| format!("saving {}", path.display()))?;
         println!("wrote {}", path.display());
     }
 

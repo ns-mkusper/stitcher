@@ -736,3 +736,72 @@ source_coord_out_of_bounds_pixels: 0
 ```
 
 Assessment: this does not improve the image by itself. It is evaluator/modeling infrastructure that lets us honestly test future local warping, optical-flow warping, or AI-guided warping without hiding generated/incorrect pixels behind a fake frame-only source map.
+
+## Coordinate-aware local warp renderer
+
+A Rust implementation of coordinate-aware local strip warping was added after the coordinate-map foundation. Unlike the earlier Python prototype, this version writes a warp-aware `--source-coord-map`, and the evaluator verifies that every output pixel matches the exact recorded source frame coordinate.
+
+New opt-in flags:
+
+```bash
+--local-warp
+--local-warp-strip-width <px>
+--local-warp-max-dy <px>
+--local-warp-protect-foreground <true|false>
+```
+
+Tested guarded configs on top of the current best external-mask setup:
+
+```bash
+stitcher stitch \
+  --mode vertical \
+  --source-selection seam-dp-motion \
+  --monotonic-frame-filter \
+  --min-shift-y 20 \
+  --max-drift-x 40 \
+  --snap-x 40 \
+  --foreground-mask-dir /workspace/rent-a-girlfriend/foreground_masks/temporal_t60 \
+  --foreground-mask-dilate 0 \
+  --foreground-mask-penalty 50 \
+  --local-warp \
+  --local-warp-strip-width 256 \
+  --local-warp-max-dy 4 \
+  --source-coord-map sw256_dy4_coord.png \
+  <timestamp-ordered frames>
+```
+
+Results:
+
+```text
+sw256_dy4:
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1925
+largest_risky_component_area: 135
+duplicate_patches: 2
+shifted_pixels: 281845
+source_coord_checked_pixels: 5107200
+source_coord_mismatched_pixels: 0
+source_coord_out_of_bounds_pixels: 0
+
+sw128_dy4:
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1943
+largest_risky_component_area: 135
+duplicate_patches: 2
+shifted_pixels: 496703
+source_coord_checked_pixels: 5107072
+source_coord_mismatched_pixels: 0
+source_coord_out_of_bounds_pixels: 0
+```
+
+Comparison to current best:
+
+```text
+external temporal mask ext_t60_d0_p50:
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+```
+
+Assessment: the coordinate-aware warp path is now honest and verifiable, but the tested local y-strip warp does not improve the image. It slightly worsens high-risk pixels while keeping source-coordinate verification clean. This suggests that simple per-strip vertical warping is not the missing lever. Future warps should be driven by a stronger correspondence model, e.g. optical flow or a mesh warp, and should continue using coordinate-map verification.
