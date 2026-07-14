@@ -805,3 +805,64 @@ duplicate_patches: 2
 ```
 
 Assessment: the coordinate-aware warp path is now honest and verifiable, but the tested local y-strip warp does not improve the image. It slightly worsens high-risk pixels while keeping source-coordinate verification clean. This suggests that simple per-strip vertical warping is not the missing lever. Future warps should be driven by a stronger correspondence model, e.g. optical flow or a mesh warp, and should continue using coordinate-map verification.
+
+## Source-backed interactive override correction
+
+A general `apply-overrides` CLI was added to support interactive/manual source ownership correction without breaking provenance. It applies rectangular corrections to an existing stitched image and source map by repainting from a specified input frame. This is intended for targeted corrections after automated seam selection plateaus.
+
+New command:
+
+```bash
+stitcher apply-overrides \
+  --stitched <current.png> \
+  --report <report.json> \
+  --source-map <current_source.png> \
+  --inputs <frame0> --inputs <frame1> ... \
+  --overrides overrides.json \
+  --output <corrected.png> \
+  --source-map-output <corrected_source.png> \
+  --source-coord-map-output <corrected_coord.png>
+```
+
+Override schema:
+
+```json
+[
+  {"source": 5, "bbox_xywh": [1736, 1413, 68, 68], "padding": 10}
+]
+```
+
+The operation is still source-backed: every corrected pixel is copied from the requested input frame, the source map is updated, and the coordinate map can verify exact provenance.
+
+A greedy source-correction prototype accepted 13 small overrides around the largest remaining high-risk components of the current best output. The same overrides were then applied through the new CLI.
+
+Artifacts:
+
+```text
+/workspace/rent-a-girlfriend/stitches/override_cli_best/override_best.png
+/workspace/rent-a-girlfriend/stitches/override_cli_best/override_best_source.png
+/workspace/rent-a-girlfriend/stitches/override_cli_best/override_best_coord.png
+/workspace/rent-a-girlfriend/stitches/override_cli_best/override_best_eval.json
+/workspace/rent-a-girlfriend/stitches/greedy_source_overrides.json
+```
+
+Metrics:
+
+```text
+previous current best:
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+
+source-backed override result:
+boundary_pixels: 18777
+high_risk_boundary_pixels: 1673
+largest_risky_component_area: 98
+duplicate_patches: 2
+source_coord_checked_pixels: 5107200
+source_coord_mismatched_pixels: 0
+source_coord_out_of_bounds_pixels: 0
+```
+
+Assessment: targeted source ownership corrections are the first frame-only approach to produce a meaningful new best on the restored screenshot sample. It reduces high-risk seam pixels by 245 and lowers the largest risky component from 135 to 98 while preserving exact source-coordinate verification. The tradeoff is a modest increase in total boundary pixels. Duplicate patches remain unchanged.
