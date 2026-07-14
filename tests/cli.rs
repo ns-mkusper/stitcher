@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use image::{GrayImage, Luma, Rgb, RgbImage};
+use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 use serde_json::json;
 use std::path::Path;
 
@@ -358,4 +358,88 @@ fn cli_eval_writes_high_risk_component_crops() {
 
     let crops: Vec<_> = std::fs::read_dir(&crops_dir).unwrap().collect();
     assert!(crops.len() >= 2, "expected stitched/source overlay crops");
+}
+
+#[test]
+fn cli_apply_overrides_repaints_from_requested_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_a = tmp.path().join("a.png");
+    let input_b = tmp.path().join("b.png");
+    let stitched = tmp.path().join("stitched.png");
+    let source_map = tmp.path().join("source_map.png");
+    let report = tmp.path().join("report.json");
+    let overrides = tmp.path().join("overrides.json");
+    let out = tmp.path().join("out.png");
+    let out_source = tmp.path().join("out_source.png");
+    let out_coord = tmp.path().join("out_coord.png");
+
+    ImageBuffer::from_pixel(30, 20, Rgb([10u8, 20, 30]))
+        .save(&input_a)
+        .unwrap();
+    ImageBuffer::from_pixel(30, 20, Rgb([200u8, 100, 50]))
+        .save(&input_b)
+        .unwrap();
+    ImageBuffer::from_pixel(40, 20, Rgb([10u8, 20, 30]))
+        .save(&stitched)
+        .unwrap();
+    let mut map = GrayImage::new(40, 20);
+    for y in 0..20 {
+        for x in 0..40 {
+            map.put_pixel(x, y, Luma([1]));
+        }
+    }
+    map.save(&source_map).unwrap();
+    std::fs::write(
+        &report,
+        serde_json::to_vec_pretty(&json!({
+            "shifts": [{"dx": -10, "dy": 0, "score": 1.0}],
+            "raw_positions": [{"x":0,"y":0},{"x":10,"y":0}],
+            "normalized_positions": [{"x":0,"y":0},{"x":10,"y":0}],
+            "canvas_width": 40,
+            "canvas_height": 20,
+            "duplicate_report": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &overrides,
+        serde_json::to_vec_pretty(&json!([
+            {"source": 1, "bbox_xywh": [12, 5, 8, 8]}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitcher")
+        .unwrap()
+        .args([
+            "apply-overrides",
+            "--stitched",
+            stitched.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--source-map",
+            source_map.to_str().unwrap(),
+            "--inputs",
+            input_a.to_str().unwrap(),
+            "--inputs",
+            input_b.to_str().unwrap(),
+            "--overrides",
+            overrides.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--source-map-output",
+            out_source.to_str().unwrap(),
+            "--source-coord-map-output",
+            out_coord.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let corrected = image::open(&out).unwrap().into_rgb8();
+    assert_eq!(*corrected.get_pixel(12, 5), Rgb([200u8, 100, 50]));
+    let corrected_map = image::open(&out_source).unwrap().into_luma8();
+    assert_eq!(corrected_map.get_pixel(12, 5).0[0], 2);
+    assert!(out_coord.exists());
 }
