@@ -57,7 +57,18 @@ pub struct StitchReport {
     pub normalized_positions: Vec<Position>,
     pub canvas_width: u32,
     pub canvas_height: u32,
+    #[serde(default)]
+    pub local_warp: Option<LocalWarpReport>,
     pub duplicate_report: Option<DuplicateReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalWarpReport {
+    pub strip_width: u32,
+    pub max_dy: i32,
+    pub protect_foreground: bool,
+    pub shifted_pixels: u32,
+    pub deltas_by_source: Vec<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +95,10 @@ pub struct StitchOptions {
     pub foreground_masks: Option<Vec<ForegroundMask>>,
     pub foreground_mask_dilate: u32,
     pub foreground_mask_penalty: f32,
+    pub local_warp: bool,
+    pub local_warp_strip_width: u32,
+    pub local_warp_max_dy: i32,
+    pub local_warp_protect_foreground: bool,
     pub seam_motion_weight: f32,
     pub seam_motion_radius: u32,
     pub seam_motion_threshold: f32,
@@ -110,6 +125,10 @@ impl Default for StitchOptions {
             foreground_masks: None,
             foreground_mask_dilate: 0,
             foreground_mask_penalty: 0.0,
+            local_warp: false,
+            local_warp_strip_width: 128,
+            local_warp_max_dy: 4,
+            local_warp_protect_foreground: true,
             seam_motion_weight: 2.0,
             seam_motion_radius: 6,
             seam_motion_threshold: 12.0,
@@ -207,7 +226,7 @@ pub fn stitch_images_with_source_map(
     let foreground_masks = opts.foreground_masks.as_deref();
     let foreground_dilate = opts.foreground_mask_dilate;
     let foreground_penalty = opts.foreground_mask_penalty;
-    let (stitched, source_map) = match opts.source_selection {
+    let (mut stitched, source_map) = match opts.source_selection {
         SourceSelection::NearestCenter => {
             synthesize_nearest_center_with_source_map(images, &positions, canvas_w, canvas_h)?
         }
@@ -238,6 +257,21 @@ pub fn stitch_images_with_source_map(
             foreground_masks,
         )?,
     };
+    let local_warp = if opts.local_warp {
+        let (warped, report) = render_local_warped_from_source_map(
+            images,
+            foreground_masks,
+            &positions,
+            &source_map,
+            opts.local_warp_strip_width,
+            opts.local_warp_max_dy,
+            opts.local_warp_protect_foreground,
+        )?;
+        stitched = warped;
+        Some(report)
+    } else {
+        None
+    };
     let duplicate_report = opts.check_duplicates.then(|| detect_duplicates(&stitched));
     if let Some(report) = &duplicate_report
         && !report.passed
@@ -251,6 +285,7 @@ pub fn stitch_images_with_source_map(
         normalized_positions: positions,
         canvas_width: canvas_w,
         canvas_height: canvas_h,
+        local_warp,
         duplicate_report,
     };
     Ok((stitched, source_map, report))
@@ -1355,6 +1390,175 @@ fn local_luma_edge_in(img: &RgbImage, x: u32, y: u32) -> f32 {
     local_luma_edge(img, x, y)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_local_warped_from_source_map(
+    images: &[RgbImage],
+    foreground_masks: Option<&[ForegroundMask]>,
+    positions: &[Position],
+    source_map: &SourceMap,
+    strip_width: u32,
+    max_dy: i32,
+    protect_foreground: bool,
+) -> Result<(RgbImage, LocalWarpReport)> {
+    if images.is_empty() {
+        bail!("need at least one image");
+    }
+    let strip_width = strip_width.max(1);
+    let strip_count = source_map.width.div_ceil(strip_width) as usize;
+    let mut deltas_by_source = vec![vec![0i32; strip_count]; images.len()];
+    for (source_idx, source_deltas) in deltas_by_source.iter_mut().enumerate() {
+        for (strip, delta) in source_deltas.iter_mut().enumerate() {
+            *delta = estimate_local_warp_delta(
+                images,
+                foreground_masks,
+                positions,
+                source_idx,
+                source_map,
+                strip as u32 * strip_width,
+                ((strip as u32 + 1) * strip_width).min(source_map.width),
+                max_dy,
+            );
+        }
+        let original = source_deltas.clone();
+        for (strip, delta) in source_deltas.iter_mut().enumerate() {
+            let start = strip.saturating_sub(1);
+            let end = (strip + 2).min(strip_count);
+            let mut vals = original[start..end].to_vec();
+            vals.sort_unstable();
+            *delta = vals[vals.len() / 2];
+        }
+    }
+
+    let mut out = ImageBuffer::from_pixel(source_map.width, source_map.height, Rgb([0, 0, 0]));
+    let mut shifted_pixels = 0u32;
+    for y in 0..source_map.height {
+        for x in 0..source_map.width {
+            let source = source_map.get(x, y);
+            if source == SourceMap::UNASSIGNED {
+                continue;
+            }
+            let source_idx = source as usize;
+            if source_idx >= images.len() {
+                continue;
+            }
+            let strip = (x / strip_width).min(strip_count as u32 - 1) as usize;
+            let mut delta = deltas_by_source[source_idx][strip];
+            if protect_foreground
+                && foreground_masks.is_some_and(|masks| {
+                    source_idx < masks.len()
+                        && mask_covers_canvas_pixel(&masks[source_idx], positions[source_idx], x, y)
+                })
+            {
+                delta = 0;
+            }
+            let sx = x as i32 - positions[source_idx].x;
+            let mut sy = y as i32 - positions[source_idx].y + delta;
+            if sx < 0 || sx >= images[source_idx].width() as i32 {
+                continue;
+            }
+            if sy < 0 || sy >= images[source_idx].height() as i32 {
+                sy = y as i32 - positions[source_idx].y;
+                delta = 0;
+            }
+            if sy >= 0 && sy < images[source_idx].height() as i32 {
+                out.put_pixel(x, y, *images[source_idx].get_pixel(sx as u32, sy as u32));
+                if delta != 0 {
+                    shifted_pixels += 1;
+                }
+            }
+        }
+    }
+    Ok((
+        out,
+        LocalWarpReport {
+            strip_width,
+            max_dy,
+            protect_foreground,
+            shifted_pixels,
+            deltas_by_source,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_local_warp_delta(
+    images: &[RgbImage],
+    foreground_masks: Option<&[ForegroundMask]>,
+    positions: &[Position],
+    source_idx: usize,
+    source_map: &SourceMap,
+    x0: u32,
+    x1: u32,
+    max_dy: i32,
+) -> i32 {
+    let mut best = (f32::INFINITY, 0i32);
+    for delta in -max_dy..=max_dy {
+        let mut total = 0.0f32;
+        let mut count = 0u32;
+        for y in (0..source_map.height).step_by(12) {
+            for x in (x0..x1).step_by(24) {
+                let source = source_map.get(x, y);
+                if source as usize != source_idx {
+                    continue;
+                }
+                if foreground_masks.is_some_and(|masks| {
+                    source_idx < masks.len()
+                        && mask_covers_canvas_pixel(&masks[source_idx], positions[source_idx], x, y)
+                }) {
+                    continue;
+                }
+                let sx = x as i32 - positions[source_idx].x;
+                let sy = y as i32 - positions[source_idx].y + delta;
+                if sx < 0
+                    || sy < 0
+                    || sx >= images[source_idx].width() as i32
+                    || sy >= images[source_idx].height() as i32
+                {
+                    continue;
+                }
+                let mut reference: Option<[u8; 3]> = None;
+                for (other_idx, other) in images.iter().enumerate() {
+                    if other_idx == source_idx {
+                        continue;
+                    }
+                    if foreground_masks.is_some_and(|masks| {
+                        other_idx < masks.len()
+                            && mask_covers_canvas_pixel(
+                                &masks[other_idx],
+                                positions[other_idx],
+                                x,
+                                y,
+                            )
+                    }) {
+                        continue;
+                    }
+                    let ox = x as i32 - positions[other_idx].x;
+                    let oy = y as i32 - positions[other_idx].y;
+                    if ox >= 0 && oy >= 0 && ox < other.width() as i32 && oy < other.height() as i32
+                    {
+                        reference = Some(other.get_pixel(ox as u32, oy as u32).0);
+                        break;
+                    }
+                }
+                if let Some(reference) = reference {
+                    total += rgb_abs_diff(
+                        images[source_idx].get_pixel(sx as u32, sy as u32).0,
+                        reference,
+                    );
+                    count += 1;
+                }
+            }
+        }
+        if count >= 20 {
+            let score = total / count as f32 + delta.unsigned_abs() as f32 * 0.1;
+            if score < best.0 {
+                best = (score, delta);
+            }
+        }
+    }
+    best.1
+}
+
 #[derive(Debug, Clone)]
 pub struct SourceCoordinateMap {
     pub width: u32,
@@ -1413,6 +1617,58 @@ impl SourceCoordinateMap {
                 }
                 let sx = x as i32 - positions[source_idx].x;
                 let sy = y as i32 - positions[source_idx].y;
+                if sx >= 0 && sy >= 0 && sx <= u16::MAX as i32 && sy <= u16::MAX as i32 {
+                    map.set(x, y, source, sx as u16, sy as u16);
+                }
+            }
+        }
+        map
+    }
+
+    pub fn from_source_map_with_local_warp(
+        source_map: &SourceMap,
+        positions: &[Position],
+        local_warp: Option<&LocalWarpReport>,
+        foreground_masks: Option<&[ForegroundMask]>,
+    ) -> Self {
+        let mut map = Self::new(source_map.width, source_map.height);
+        for y in 0..source_map.height {
+            for x in 0..source_map.width {
+                let source = source_map.get(x, y);
+                if source == SourceMap::UNASSIGNED {
+                    continue;
+                }
+                let source_idx = source as usize;
+                if source_idx >= positions.len() {
+                    continue;
+                }
+                let sx = x as i32 - positions[source_idx].x;
+                let mut sy = y as i32 - positions[source_idx].y;
+                if let Some(warp) = local_warp
+                    && source_idx < warp.deltas_by_source.len()
+                    && warp.strip_width > 0
+                {
+                    let strip = ((x / warp.strip_width) as usize)
+                        .min(warp.deltas_by_source[source_idx].len().saturating_sub(1));
+                    let mut delta = warp.deltas_by_source[source_idx]
+                        .get(strip)
+                        .copied()
+                        .unwrap_or(0);
+                    if warp.protect_foreground
+                        && foreground_masks.is_some_and(|masks| {
+                            source_idx < masks.len()
+                                && mask_covers_canvas_pixel(
+                                    &masks[source_idx],
+                                    positions[source_idx],
+                                    x,
+                                    y,
+                                )
+                        })
+                    {
+                        delta = 0;
+                    }
+                    sy += delta;
+                }
                 if sx >= 0 && sy >= 0 && sx <= u16::MAX as i32 && sy <= u16::MAX as i32 {
                     map.set(x, y, source, sx as u16, sy as u16);
                 }
@@ -2529,6 +2785,20 @@ mod tests {
         assert!(!report.passed);
         assert!(report.high_risk_boundary_pixels > 0);
         assert!(report.largest_risky_component_area > 0);
+    }
+
+    #[test]
+    fn local_warp_report_is_optional_for_old_reports() {
+        let value = serde_json::json!({
+            "shifts": [],
+            "raw_positions": [{"x":0,"y":0}],
+            "normalized_positions": [{"x":0,"y":0}],
+            "canvas_width": 10,
+            "canvas_height": 10,
+            "duplicate_report": null
+        });
+        let report: StitchReport = serde_json::from_value(value).unwrap();
+        assert!(report.local_warp.is_none());
     }
 
     #[test]
