@@ -805,3 +805,99 @@ duplicate_patches: 2
 ```
 
 Assessment: the coordinate-aware warp path is now honest and verifiable, but the tested local y-strip warp does not improve the image. It slightly worsens high-risk pixels while keeping source-coordinate verification clean. This suggests that simple per-strip vertical warping is not the missing lever. Future warps should be driven by a stronger correspondence model, e.g. optical flow or a mesh warp, and should continue using coordinate-map verification.
+
+## Plex episode / source-video experiments
+
+The Plex server was reachable via the home-lab Chicago SSH helpers. The episode file used was:
+
+```text
+/mnt/data1/torrents/Rent-a-Girlfriend.S05E12.Loneliness.and.Girlfriend.1080p.CR.WEB-DL.DUAL.AAC2.0.H.264.MSubs-ToonsHub.mkv
+```
+
+A 4fps low-resolution scan was used to detect vertical pan candidates in the episode. Full-resolution frames were then extracted around the strongest candidate windows and stitched with the current source-coordinate-verified pipeline.
+
+Candidate windows tested:
+
+```text
+cand00: ~1336.75s, 20 frames
+cand01: ~1199.75s, 20 frames
+cand02: ~1309.00s, 20 frames
+cand03: ~130.75s, 20 frames
+cand04: ~60.25s, 20 frames
+```
+
+Command pattern:
+
+```bash
+stitcher stitch \
+  --mode vertical \
+  --source-selection seam-dp-motion \
+  --monotonic-frame-filter \
+  --min-shift-y 2 \
+  --max-drift-x 20 \
+  --snap-x 20 \
+  --source-map <candidate>_source.png \
+  --source-coord-map <candidate>_coord.png \
+  --report <candidate>_report.json \
+  --output <candidate>.png \
+  <20 extracted video frames>
+```
+
+Results:
+
+```text
+cand00:
+image_size: 1920x2964
+boundary_pixels: 54493
+high_risk_boundary_pixels: 1067
+largest_risky_component_area: 284
+duplicate_patches: 20
+source_coord_mismatched_pixels: 0
+
+cand01:
+image_size: 1920x1968
+boundary_pixels: 32676
+high_risk_boundary_pixels: 133
+largest_risky_component_area: 0
+duplicate_patches: 12
+source_coord_mismatched_pixels: 0
+
+cand02:
+image_size: 1920x2004
+boundary_pixels: 49717
+high_risk_boundary_pixels: 307
+largest_risky_component_area: 0
+duplicate_patches: 7
+source_coord_mismatched_pixels: 0
+
+cand03:
+image_size: 1920x2708
+boundary_pixels: 43901
+high_risk_boundary_pixels: 2532
+largest_risky_component_area: 354
+duplicate_bands: 3
+duplicate_patches: 20
+source_coord_mismatched_pixels: 0
+
+cand04:
+image_size: 1920x2444
+boundary_pixels: 30124
+high_risk_boundary_pixels: 4162
+largest_risky_component_area: 523
+duplicate_patches: 20
+source_coord_mismatched_pixels: 0
+```
+
+Assessment: additional video frames from the episode did not immediately produce a better full-pan output. The best low-risk candidate (`cand01`) has fewer high-risk seam pixels, but it is much shorter vertically (`1968px` vs the current best `2660px`) and still has many duplicate patches. Several candidates contain bad alignment jumps and many near-duplicate frames. More frames alone are not enough; the pipeline needs frame selection/keyframe pruning and candidate-window identification before source-video frames can improve the result.
+
+Current best remains:
+
+```text
+/workspace/rent-a-girlfriend/stitches/external_mask_sweep/ext_t60_d0_p50.png
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+```
+
+Next source-video step: automatically select sparse keyframes from the true pan interval by rejecting near-duplicates and rejecting pairwise shifts with low score or large jump discontinuities before stitching.
