@@ -58,6 +58,7 @@ fn cli_stitches_horizontal_pan_and_writes_report() {
     let out = tmp.path().join("out.png");
     let report = tmp.path().join("report.json");
     let source_map = tmp.path().join("source_map.png");
+    let source_coord_map = tmp.path().join("source_coord_map.png");
     let eval_report = tmp.path().join("eval.json");
     let eval_overlay = tmp.path().join("eval_overlay.png");
     save_crop(&canvas, 0, 0, 400, 300, &a);
@@ -74,6 +75,8 @@ fn cli_stitches_horizontal_pan_and_writes_report() {
             report.to_str().unwrap(),
             "--source-map",
             source_map.to_str().unwrap(),
+            "--source-coord-map",
+            source_coord_map.to_str().unwrap(),
             a.to_str().unwrap(),
             b.to_str().unwrap(),
             c.to_str().unwrap(),
@@ -99,6 +102,14 @@ fn cli_stitches_horizontal_pan_and_writes_report() {
             report.to_str().unwrap(),
             "--source-map",
             source_map.to_str().unwrap(),
+            "--source-coord-map",
+            source_coord_map.to_str().unwrap(),
+            "--inputs",
+            a.to_str().unwrap(),
+            "--inputs",
+            b.to_str().unwrap(),
+            "--inputs",
+            c.to_str().unwrap(),
             "--output",
             eval_report.to_str().unwrap(),
             "--overlay",
@@ -110,6 +121,9 @@ fn cli_stitches_horizontal_pan_and_writes_report() {
     let eval_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(eval_report).unwrap()).unwrap();
     assert_eq!(eval_json["passed"], true);
+    assert!(eval_json["source_coord_checked_pixels"].as_u64().unwrap() > 0);
+    assert_eq!(eval_json["source_coord_mismatched_pixels"], 0);
+    assert_eq!(eval_json["source_coord_out_of_bounds_pixels"], 0);
     assert!(eval_overlay.exists());
 }
 

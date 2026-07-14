@@ -544,3 +544,195 @@ external temporal foreground mask:
 ```
 
 Assessment: external masks produced the best high-risk metric so far and eliminated the lower hand/pocket source seam without blur, crop, or fake maps. The duplicate-patch gate remains unchanged. A true SAM2/segmentation mask may do better than the temporal-disagreement masks used here because it can protect the full subject instead of only high-disagreement pixels, but this should be tested through the same mask input path.
+
+## Manual / SAM-like mask experiment
+
+Broad hand-authored subject-region masks were tested as a stand-in for full-subject SAM/SAM2 masks. This was intended to answer whether protecting the whole visible subject would outperform temporal-disagreement masks.
+
+Mask families tested outside Rust:
+
+```text
+lower_pocket
+pocket_waist
+torso_subject
+broad_subject
+body_column
+```
+
+Sweep:
+
+```text
+foreground_mask_dilate: 0, 4, 8, 16
+foreground_mask_penalty: 25, 50, 100, 250
+```
+
+Best manual-mask result by high-risk metric:
+
+```text
+body_column_d0_p100:
+boundary_pixels: 17916
+high_risk_boundary_pixels: 1937
+largest_risky_component_area: 194
+duplicate_patches: 2
+lower hand/pocket seam px: 199
+upper waist seam px: 2965
+full body-middle seam px: 5658
+```
+
+Best lower-pocket-protecting examples kept the pocket seam at zero but still did not beat the temporal external-mask result overall:
+
+```text
+lower_pocket_d0_p25:
+boundary_pixels: 17431
+high_risk_boundary_pixels: 2083
+largest_risky_component_area: 125
+duplicate_patches: 2
+lower hand/pocket seam px: 0
+```
+
+Assessment: broad/manual subject masks are not automatically better. They often protect too much foreground and force seams into worse upper-waist/background paths. The temporal-disagreement masks remain better overall because they protect only regions that actually disagree across frames.
+
+Next experiment: hybrid masks, e.g. temporal disagreement clipped to a subject/semantic mask.
+
+## Hybrid temporal/subject mask experiment
+
+Hybrid masks were tested to see if `temporal disagreement ∩ subject-region mask` could beat the current external temporal mask. This approximates using a semantic/SAM-style subject mask to clip or refine temporal masks.
+
+Prototype:
+
+```text
+/workspace/rent-a-girlfriend/prototype_hybrid_masks.py
+```
+
+Completed hybrid-mask evals:
+
+```text
+972
+```
+
+Best hybrid by high-risk metric:
+
+```text
+hybrid_temporal_minus_background_pocket_waist_t45_x2_d8_p100:
+boundary_pixels: 18550
+high_risk_boundary_pixels: 1900
+largest_risky_component_area: 194
+duplicate_patches: 2
+lower hand/pocket seam px: 87
+upper waist seam px: 3097
+full body-middle seam px: 7271
+```
+
+Comparison to current external temporal-mask best:
+
+```text
+external temporal mask ext_t60_d0_p50:
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+lower hand/pocket seam px: 0
+upper waist seam px: 2689
+full body-middle seam px: 6997
+```
+
+Assessment: the hybrid technically reduced high-risk pixels by 18, but worsened the largest component and reintroduced hand/pocket seam pixels. It should not replace the current external temporal-mask output.
+
+## Local strip-alignment seam-cost experiment
+
+A guarded local strip-alignment prototype tested whether estimating small local vertical offsets per x-strip could improve seam placement without broad image warping. The estimated local offsets were used only in seam-cost comparison; rendered pixels still came from original frames.
+
+Prototype:
+
+```text
+/workspace/rent-a-girlfriend/prototype_local_strip_alignment.py
+```
+
+Limited sweep:
+
+```text
+strip_width / max_dy / foreground_penalty:
+128 / 8  / 0
+128 / 8  / 50
+128 / 16 / 50
+256 / 16 / 50
+```
+
+Best local strip result:
+
+```text
+sw128_dy8_fg0:
+boundary_pixels: 16595
+high_risk_boundary_pixels: 2156
+largest_risky_component_area: 129
+duplicate_patches: 2
+```
+
+Comparison to current external temporal-mask best:
+
+```text
+external temporal mask ext_t60_d0_p50:
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+```
+
+Assessment: strip alignment reduced total boundary pixels, but increased high-risk seam pixels. It is not a better output. The result suggests local alignment may help seam length/coverage, but the current cost-only approach can move seams onto more visible edges. A future version would need to either render with a truthful warp map or use local alignment only inside a stronger global optimizer.
+
+## Source-coordinate map foundation
+
+A source-coordinate map foundation was added to make future local-warp experiments objectively auditable. The normal source map stores only the selected source frame id. The new coordinate map stores, per stitched pixel:
+
+```text
+R: source index + 1, or 0 for unassigned
+G: source x coordinate
+B: source y coordinate
+```
+
+It is written as a 16-bit RGB PNG via:
+
+```bash
+--source-coord-map <path.png>
+```
+
+The evaluator can verify it with:
+
+```bash
+stitcher eval \
+  --stitched <stitched.png> \
+  --report <report.json> \
+  --source-map <source.png> \
+  --source-coord-map <coord.png> \
+  --inputs <frame0> --inputs <frame1> ... \
+  --output <eval.json>
+```
+
+Coordinate verification checks that every stitched pixel exactly matches the recorded source frame and source coordinate. This creates a non-cheating path for future local warp experiments: any warped render must declare the exact source coordinate used for every output pixel.
+
+Validation on the current best external-mask output:
+
+```text
+/workspace/rent-a-girlfriend/stitches/source_coord_check/ext_t60_d0_p50.png
+/workspace/rent-a-girlfriend/stitches/source_coord_check/ext_t60_d0_p50_coord.png
+/workspace/rent-a-girlfriend/stitches/source_coord_check/ext_t60_d0_p50_eval.json
+```
+
+Metrics remain unchanged:
+
+```text
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+```
+
+Coordinate verification:
+
+```text
+source_coord_checked_pixels: 5107200
+source_coord_mismatched_pixels: 0
+source_coord_out_of_bounds_pixels: 0
+```
+
+Assessment: this does not improve the image by itself. It is evaluator/modeling infrastructure that lets us honestly test future local warping, optical-flow warping, or AI-guided warping without hiding generated/incorrect pixels behind a fake frame-only source map.
