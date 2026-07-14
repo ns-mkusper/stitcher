@@ -902,3 +902,71 @@ source_coord_out_of_bounds_pixels: 0
 ```
 
 Next possible source-video route: use a more discriminative visual search than whole-frame MAE/NCC, e.g. local patch matching on distinctive foreground/background regions or OCR/time-aware Plex playback metadata if available.
+
+## Discriminative patch-cluster extraction and keyframe sweep
+
+A more discriminative screenshot-to-video search was tried using local patches from each restored screenshot:
+
+```text
+left_bg
+center_subject
+right_bg
+lower_mid
+top_band
+```
+
+Patch features combined edge/NCC with weak color similarity, then clustered matches by episode/time. The top clusters were extracted as full-resolution 12-second clips and sparse keyframe subsets were stitched.
+
+Top extracted cluster outputs were saved under:
+
+```text
+/workspace/rent-a-girlfriend/patch_cluster_frames/
+/workspace/rent-a-girlfriend/patch_cluster_stitches/
+```
+
+Best clean patch-cluster output:
+
+```text
+cluster04_s4last02_740_s3_k8_n9:
+image_size: 848x1110
+boundary_pixels: 6581
+high_risk_boundary_pixels: 117
+largest_risky_component_area: 0
+duplicate_patches: 0
+failures: []
+```
+
+Other clean cluster outputs:
+
+```text
+cluster04_s4last02_740_s6_k8_n9:
+high_risk_boundary_pixels: 122
+duplicate_patches: 0
+failures: []
+
+cluster04_s4last02_740_s0_k6_n12:
+high_risk_boundary_pixels: 128
+duplicate_patches: 0
+failures: []
+
+cluster06_s5e09_814_s3_k8_n9:
+high_risk_boundary_pixels: 223
+duplicate_patches: 0
+failures: []
+```
+
+Assessment: patch-cluster search can find clean stitchable video pan clips, but these are not the target 1920x2660 screenshot pan. The best outputs are 848px wide library-video clips with much shorter vertical coverage. They demonstrate the generic keyframe/video pipeline works, but they do not replace the restored screenshot benchmark output.
+
+Current benchmark best remains:
+
+```text
+/workspace/rent-a-girlfriend/stitches/current_best_regen/ext_t60_d0_p50.png
+image_size: 1920x2660
+boundary_pixels: 18034
+high_risk_boundary_pixels: 1918
+largest_risky_component_area: 135
+duplicate_patches: 2
+source_coord_mismatched_pixels: 0
+```
+
+Conclusion: the missing piece is still not seam logic; it is source identification. The Plex files searched so far contain similar stitchable pans, but not the exact target pan/source. Without the exact source clip or a higher-quality subject/background reconstruction method, current best is the strongest non-cheating result.
